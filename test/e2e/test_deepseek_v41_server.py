@@ -3,11 +3,12 @@ points: verify steps with DSpark (8 requests of 6 rows at the largest width) and
 decode steps without it (48 rows). Each server's startup lines show its tested
 batches run the monokernels; batches step past the largest width and back (a short
 GSM8K run, for gross failures), and the tokens of covered steps are scored again by
-the normal prefill path (KL consistency), on short prompts and on prompts past the
-indexer's candidate span (its two-level steps), with a passkey to find there. A
-fault on one rank stops the server before any token of the failed step is sent.
-Every backbone layer runs whole; the kernel checks cover each form of K1's input
-and each kind of K2i launch."""
+the normal prefill path (KL consistency) on short prompts. The DSpark server also
+runs prompts past the indexer's candidate span (its two-level steps), with a
+passkey to find there; decode steps run the same K2i launches. A fault on one rank
+stops the server before any token of the failed step is sent. Every backbone layer
+runs whole; the kernel checks cover each form of K1's input and each kind of K2i
+launch."""
 
 import os
 import re
@@ -164,10 +165,22 @@ class _Serving:
             trust_remote_code=True,
         )
 
+
+class TestMonokernelVerify(_Serving, CustomTestCase):
+    """DSpark verify steps: above 8 requests (48 rows) the normal path."""
+
+    SERVER_ARGS, PARALLEL = ARGS, 12
+    RUNS = (
+        "monokernel deepseek_v41_hip on gfx950 runs target_verify steps of batch "
+        "size [1, 2, 3, 4, 5, 6, 7, 8] x 6 tokens",
+        "monokernel deepseek_v41_dspark_draft_hip on gfx950 runs target_verify steps "
+        "of batch size [1, 2, 3, 4, 5, 6, 7, 8",
+    )
+
     def test_long_prompts_match_prefill(self):
-        # past the candidate span every decode or verify step is two-level: the
-        # candidate source scores the whole context and keeps its best blocks, the
-        # index sources after it score only those (K2i's three launch kinds)
+        # past the candidate span every verify step is two-level: the candidate
+        # source scores the whole context and keeps its best blocks, the index
+        # sources after it score only those (K2i's three launch kinds)
         prompts = _long_prompts()
         decoded = _logprobs(input_ids=prompts, max_new_tokens=128, logprob_start_len=-1)
         outputs = [
@@ -214,18 +227,6 @@ class _Serving:
         text = r.json()["text"]
         print(f"passkey answer: {text!r}")
         self.assertIn(PASSKEY, text)
-
-
-class TestMonokernelVerify(_Serving, CustomTestCase):
-    """DSpark verify steps: above 8 requests (48 rows) the normal path."""
-
-    SERVER_ARGS, PARALLEL = ARGS, 12
-    RUNS = (
-        "monokernel deepseek_v41_hip on gfx950 runs target_verify steps of batch "
-        "size [1, 2, 3, 4, 5, 6, 7, 8] x 6 tokens",
-        "monokernel deepseek_v41_dspark_draft_hip on gfx950 runs target_verify steps "
-        "of batch size [1, 2, 3, 4, 5, 6, 7, 8",
-    )
 
 
 class TestMonokernelDecode(_Serving, CustomTestCase):
