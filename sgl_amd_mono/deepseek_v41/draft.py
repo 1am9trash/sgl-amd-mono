@@ -242,7 +242,7 @@ SPEC = MonoSpec(
     numerics=target.NUMERICS,
     model_disable_reasons=_model_disable_reasons,
     build=_build,
-    api=1,  # sglang.srt.monokernels.spec.API_VERSION
+    api_version=1,  # sglang.srt.monokernels.spec.MONOKERNEL_API_VERSION
     load_tensor=_load_tensor,
     tokens_per_request=_tokens_per_request,
 )

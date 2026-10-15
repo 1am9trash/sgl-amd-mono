@@ -77,7 +77,7 @@ ROPE_TABLES: list = []
 # parameter, ``"x"``: a string literal); test/unit/test_contract.py pins them.
 SGLANG_READS = {
     "srt/monokernels/spec.py": (
-        "API_VERSION",
+        "MONOKERNEL_API_VERSION",
         "DeviceLimits",
         "Feature",
         "MonoSpec",
@@ -990,7 +990,7 @@ SPEC = MonoSpec(
     numerics=NUMERICS,
     model_disable_reasons=_model_disable_reasons,
     build=_build,
-    api=1,  # sglang.srt.monokernels.spec.API_VERSION
+    api_version=1,  # sglang.srt.monokernels.spec.MONOKERNEL_API_VERSION
     config_disable_reasons=_config_disable_reasons,
     load_tensor=_load_tensor,
 )
