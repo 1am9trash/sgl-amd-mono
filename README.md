@@ -6,6 +6,8 @@
 
 The library implements SGLang's monokernel interface ([RFC #43949](https://github.com/sgl-project/sglang/issues/43949)) and loads as an SGLang [general plugin](https://github.com/sgl-project/sglang/blob/main/docs/docs/hardware-platforms/plugin.mdx) (the `sglang.srt.plugins` entry point), which registers each model's spec under the monokernel backend `amd`. With `--monokernel-backend amd`, every decode and speculative-verify step that a spec serves runs on its kernels, and every other step runs SGLang's standard path.
 
+> **Experimental:** `--monokernel-backend` is an experimental SGLang feature. The kernels, the models and setups they cover, and the plugin interface may change.
+
 ## Features
 
 ### Supported Models
