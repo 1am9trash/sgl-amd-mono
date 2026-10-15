@@ -598,7 +598,11 @@ def _weights(copies: dict, tables: list, layer, i: int) -> _Layer:
     )
     L.k2.check(d)
     L.ratio = a.compress_ratio
-    L.index = a.compressor is not None or a.indexer is not None
+    # the DSpark draft's window-only attention has neither
+    L.index = (
+        getattr(a, "compressor", None) is not None
+        or getattr(a, "indexer", None) is not None
+    )
     return L
 
 
