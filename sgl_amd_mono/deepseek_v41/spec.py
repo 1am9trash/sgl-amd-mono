@@ -801,6 +801,11 @@ class _Built:
         self.lm, self.model, self.runner, self._layers = lm, lm.model, runner, layers
         self._normal_moe = lm.model.layers[min(layers)].mlp
 
+    def skips_metadata(self, name, forward_batch, key, source) -> bool:
+        """A routed step scores every index source with K2i (``_select``): SGLang's
+        aiter decode schedule of a ratio is never read."""
+        return name == "low_ratio_decode_schedule"
+
     def forward(
         self, plan, input_ids, positions, forward_batch, input_embeds=None, *_, **__
     ):
