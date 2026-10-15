@@ -21,6 +21,7 @@ from sglang.srt.monokernels.spec import (
     DeviceLimits,
     Feature,
     MonoSpec,
+    Requirements,
 )
 
 from sgl_amd_mono.common.plan import BLOCKS
@@ -36,7 +37,7 @@ _CKPT_SHARED = re.compile(
 # The SGLang names this module reads, by file under the sglang package (``f(p)``: a
 # parameter, ``"x"``: a string literal); test/unit/test_contract.py pins them.
 SGLANG_READS = {
-    "srt/monokernels/spec.py": ("DeviceLimits", "Feature", "MonoSpec"),
+    "srt/monokernels/spec.py": ("DeviceLimits", "Feature", "MonoSpec", "Requirements"),
     "kernels/ops/layernorm/mhc.py": ("hc_combine",),
     "srt/environ.py": ("envs", "SGLANG_DSPARK_EMBED_IN_GRAPH"),
     "srt/layers/logits_processor.py": (
@@ -169,10 +170,6 @@ class _Draft:
     def __init__(self, lm, runner, stages: list):
         self.lm, self.runner, self.stages = lm, runner, stages
 
-    def serves(self, key) -> bool:
-        """Every draft block of a built width."""
-        return key.forward_mode == "target_verify"
-
     def forward(
         self, plan, input_ids, positions, forward_batch, input_embeds=None, *_, **__
     ):
@@ -240,9 +237,9 @@ SPEC = MonoSpec(
         )
     },
     features=frozenset({Feature.SPECULATIVE_DECODING}),
-    requires=target.SPEC.requires,
+    # the launcher checks the target's requirements; the capture check, this
+    requires=Requirements(attention_backends=target.SPEC.requires.attention_backends),
     numerics=target.NUMERICS,
-    config_disable_reasons=lambda cfg, hf_config: [],
     model_disable_reasons=_model_disable_reasons,
     build=_build,
     api=1,  # sglang.srt.monokernels.spec.API_VERSION

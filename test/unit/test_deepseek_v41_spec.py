@@ -1,6 +1,7 @@
 """The DeepSeek-V4.1 gfx950 monokernel spec on CPU (RFC #43949): the layers its
-forward covers on the DeepSeek-V4.1-Flash layer structure, the steps it serves,
-its widths, its registry entry, its per-output bounds and its refusal reasons."""
+forward covers on the DeepSeek-V4.1-Flash layer structure, its registry entry, its
+per-output bounds and its model refusal reasons. SGLang checks its declared
+requirements, the same way for every spec."""
 
 from types import SimpleNamespace
 
@@ -55,40 +56,6 @@ def test_kv_records_are_bit_exact():
     # largest width), so the kernel checks hold K1's KV records to bit-exact
     for spec in (dsv41.SPEC, draft.SPEC):
         assert spec.numerics.bound("k1.kv.max_abs") == 0.0
-
-
-def _cfg(**kw):
-    defaults = {
-        "speculative_algorithm": "DSPARK",
-        "fp8_gemm_runner_backend": "aiter",
-        "enable_encoder_swa_bounded_replay": False,
-    }
-    return SimpleNamespace(**{**defaults, **kw})
-
-
-def test_config_reasons_name_each_mismatch():
-    reasons = dsv41.SPEC.config_disable_reasons(_cfg(), FLASH)
-    assert not any("DeepSeek-V4.1-Flash" in r or "speculative" in r for r in reasons), (
-        reasons
-    )
-    other = SimpleNamespace(
-        **{**vars(FLASH), "hidden_size": 7168, "model_type": "deepseek_v4"}
-    )
-    reasons = dsv41.SPEC.config_disable_reasons(
-        _cfg(speculative_algorithm="EAGLE"), other
-    )
-    text = " | ".join(reasons)
-    for want in ("hidden_size = 5120", "deepseek_v41", "speculative algorithm EAGLE"):
-        assert want in text, text
-    reasons = dsv41.SPEC.config_disable_reasons(
-        _cfg(enable_encoder_swa_bounded_replay=True), FLASH
-    )
-    assert any("request window" in r for r in reasons), reasons
-    # the default FP8 GEMM backend reorders the attention weights in place
-    reasons = dsv41.SPEC.config_disable_reasons(
-        _cfg(fp8_gemm_runner_backend="auto"), FLASH
-    )
-    assert any("--fp8-gemm-backend 'auto'" in r for r in reasons), reasons
 
 
 def _layer(i, **attn):

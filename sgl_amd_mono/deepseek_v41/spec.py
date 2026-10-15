@@ -118,13 +118,14 @@ SGLANG_READS = {
     "kernels/ops/layernorm/mhc.py": ("hc_broadcast", "hc_combine"),
     "kernels/ops/layernorm/mhc_boundary_hip.py": ("tensors",),
     "srt/arg_groups/fields/*.py": (
+        "kv_cache_dtype",
+        "moe_runner_backend",
         "speculative_algorithm",
         "enable_encoder_swa_bounded_replay",
         "fp8_gemm_runner_backend",
         "context_length",
     ),
     "srt/environ.py": (
-        "envs",
         "SGLANG_DSV4_FP4_EXPERTS",
         "SGLANG_DSV4_FP4_DEQUANT",
         "SGLANG_USE_AITER_MOE_GU_ITLV",
@@ -325,43 +326,21 @@ def _covered_layers(config) -> list[int]:
 
 
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
+    """What ``SPEC.requires`` cannot state: a value SGLang's attention gate must not
+    take, aiter's own flag, and FlyDSL."""
     from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
         is_unified_kv_triton,
     )
-    from sglang.srt.environ import envs
     from sglang.srt.utils import get_bool_env_var
 
-    reasons = [
-        f"needs DeepSeek-V4.1-Flash's {key} = {want!r}"
-        for key, want in HF_CONFIG.items()
-        if getattr(hf_config, key, None) != want
-    ]
-    if hf_config.model_type != "deepseek_v41":
-        reasons.append(f"model type {hf_config.model_type!r}, needs deepseek_v41")
-    backend = cfg.fp8_gemm_runner_backend
-    if backend != "aiter":
-        # the other FP8 GEMM backends reorder wqkv_a, wq_b and wo_b in place
+    reasons = []
+    if is_unified_kv_triton():
+        reasons.append("needs the paged SWA cache, not unified_kv")
+    if get_bool_env_var("AITER_FORCE_A8W4"):
         reasons.append(
-            f"--fp8-gemm-backend {backend!r}: needs aiter, which keeps the attention "
-            "weights row-major for K1 and K2"
+            "needs the MXFP4 experts in aiter's gate / up interleaved layout, not "
+            "AITER_FORCE_A8W4"
         )
-    algo = (cfg.speculative_algorithm or "NONE").upper()
-    if algo not in ("NONE", "DSPARK"):
-        # DSpark's target steps are uniform verify steps; other drafts differ
-        reasons.append(f"speculative algorithm {algo}: only DSpark")
-    if (
-        not envs.SGLANG_DSV4_FP4_EXPERTS.get()
-        or envs.SGLANG_DSV4_FP4_DEQUANT.get()
-        or not envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
-        or get_bool_env_var("AITER_FORCE_A8W4")
-    ):
-        reasons.append(
-            "needs the MXFP4 experts in aiter's gate / up interleaved layout"
-        )
-    if is_unified_kv_triton() or cfg.enable_encoder_swa_bounded_replay:
-        reasons.append("needs the paged SWA cache, not unified_kv or a request window")
-    if envs.SGLANG_DSV4_KV_LAYOUT.get().lower() != "v4":
-        reasons.append("needs the V4 KV layout (fp8 nope, bf16 rope, 584 B a token)")
     if importlib.util.find_spec("flydsl") is None:
         reasons.append("needs FlyDSL")
     return reasons
@@ -822,10 +801,6 @@ class _Built:
         self.lm, self.model, self.runner, self._layers = lm, lm.model, runner, layers
         self._normal_moe = lm.model.layers[min(layers)].mlp
 
-    def serves(self, key) -> bool:
-        """Every decode and DSpark verify step of a built width."""
-        return key.forward_mode in ("decode", "target_verify")
-
     def forward(
         self, plan, input_ids, positions, forward_batch, input_embeds=None, *_, **__
     ):
@@ -990,14 +965,32 @@ SPEC = MonoSpec(
     features=frozenset({Feature.SPECULATIVE_DECODING}),
     requires=Requirements(
         dtypes=frozenset({"bfloat16"}),
-        kv_cache_dtypes=frozenset({"fp8_e4m3"}),
         attention_backends=frozenset({"dsv4"}),
-        moe_runner_backends=frozenset({"auto", "aiter"}),
+        server_args={
+            "kv_cache_dtype": frozenset({"fp8_e4m3"}),
+            "moe_runner_backend": frozenset({"auto", "aiter"}),
+            # the other FP8 GEMM backends reorder wqkv_a, wq_b and wo_b in place;
+            # K1 and K2 read them row-major
+            "fp8_gemm_runner_backend": frozenset({"aiter"}),
+            # DSpark's target steps are uniform verify steps; other drafts differ
+            "speculative_algorithm": frozenset({None, "DSPARK"}),
+            # the paged SWA cache, not a request window
+            "enable_encoder_swa_bounded_replay": frozenset({False}),
+        },
+        hf_config={**HF_CONFIG, "model_type": "deepseek_v41"},
+        env={
+            # the MXFP4 experts in aiter's gate / up interleaved layout
+            "SGLANG_DSV4_FP4_EXPERTS": True,
+            "SGLANG_DSV4_FP4_DEQUANT": False,
+            "SGLANG_USE_AITER_MOE_GU_ITLV": True,
+            # fp8 nope and bf16 rope, 584 B a token
+            "SGLANG_DSV4_KV_LAYOUT": "v4",
+        },
     ),
     numerics=NUMERICS,
-    config_disable_reasons=_config_disable_reasons,
     model_disable_reasons=_model_disable_reasons,
     build=_build,
     api=1,  # sglang.srt.monokernels.spec.API_VERSION
+    config_disable_reasons=_config_disable_reasons,
     load_tensor=_load_tensor,
 )
