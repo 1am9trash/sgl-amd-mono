@@ -1,0 +1,999 @@
+# SPDX-License-Identifier: Apache-2.0
+"""DeepSeek-V4.1-Flash on gfx950: the monokernel spec and its forward (RFC #43949).
+
+SGLang's runtime switches the model's forward at attach: a routed decode or DSpark
+verify step runs ``_Built.forward`` here, which takes and returns what
+``DeepseekV4ForCausalLM.forward`` does: SGLang's input preparation, the embedding,
+every layer in two launches, the head's combine and norm, and SGLang's logits
+processor, with SGLang's own modules where SGLang owns the state.
+
+- Each layer is K1, then K2. K1 runs the attention seam and front and writes the
+  step's SWA KV records and K2's key table; K2 runs the attention core, wo_a,
+  wo_b, the FFN seam, the MoE and both all-reduces. The core reads KV records that
+  every workgroup of K1 wrote, and each gfx950 XCD has its own L2: a launch
+  boundary is the cheapest device-wide release.
+  - K1 folds the previous layer's pending post into the residual. Where none is
+    owed (the first layer's broadcast embedding; an Engram layer, whose Engram
+    write runs on the settled residual) it takes the residual as it is, collapsed
+    with the previous pre (copy 0 on the first).
+  - An index source (ratio 1 or 2): K1 also writes its normed input and qr.
+    Between the launches, SGLang's ``forward_low_ratio_sources`` runs the layer's
+    compressor (the KV sources) on them, as SGLang runs it before the attention;
+    then K2i (``gfx950/indexer``) scores the index keys and SGLang's top-k
+    kernels write the layer's top-512 into SGLang's sparse indices of its ratio,
+    as SGLang's decode indexer decides (``_select``), and K2 builds the key table
+    from them.
+  - A window-only layer (ratio 0) reads no compressed cache.
+  - DSpark's target layers: the mean of the residual K1 rebuilds, the residual
+    SGLang's loop captures.
+
+Every layer must be one of these; a model with another is refused. The FFN
+launch (``gfx950/layer.py``) runs in no forward: the kernel checks use it as the
+reference for K2's FFN half.
+
+The kernels read SGLang's weights in place, except the copies logged at startup:
+each covered layer's FP8 shared expert (this rank's shard, kept at load, because
+``--enforce-shared-experts-fusion`` converts it to MXFP4), the E8M0 codes of the
+f32 block scales, the f32 router bias, this rank's f32 attention sinks, the RoPE
+table (one per table: layers 0 and 1 have their own), and wo_a as MXFP8 where
+SGLang dequantized it to bf16 (K2 widens it back to bf16 in registers and keeps
+the attention output in bf16, as the normal path's wo_a does). Pad rows write KV
+slot 0, the reserved dummy slot, as the normal path does.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import re
+from typing import Any
+
+import msgspec
+import torch
+from sglang.srt.monokernels.spec import (
+    DeviceLimits,
+    Feature,
+    MonoSpec,
+    Numerics,
+    NumericsKind,
+    Requirements,
+)
+
+from sgl_amd_mono.common.plan import BLOCKS
+from sgl_amd_mono.deepseek_v41 import CANDIDATES, HF_CONFIG
+
+MAX_ROWS = 48  # the rows a launch takes at most (``layer.MAX_TOKENS``)
+
+_SHARED = ("gate_proj", "up_proj", "down_proj")
+# the checkpoint's shared expert tensors, as the model loader reads them
+_CKPT_SHARED = re.compile(
+    r"layers\.(?P<i>\d+)\.ffn\.shared_experts\.(?P<w>w[123])\.(?P<kind>weight|scale)"
+)
+_CKPT_PROJ = {"w1": "gate_proj", "w3": "up_proj", "w2": "down_proj"}
+# the (freqs_cis, table) pairs built in this process: the target's and the DSpark
+# draft's equal tables share one copy
+ROPE_TABLES: list = []
+
+# The SGLang names this glue reads, by file under the sglang package (``f(p)``: a
+# parameter, ``"x"``: a string literal); test/unit/test_contract.py pins them.
+SGLANG_READS = {
+    "srt/monokernels/spec.py": (
+        "API_VERSION",
+        "DeviceLimits",
+        "Feature",
+        "MonoSpec",
+        "Numerics",
+        "NumericsKind",
+        "Requirements",
+        "tokens_per_request",
+    ),
+    # an index source whose rows SGLang's decode indexer does not score
+    "kernels/ops/attention/dsv4/__init__.py": ("topk_transform_paged",),
+    "kernels/ops/attention/dsv4/topk.py": (
+        "topk_transform_paged(scores)",
+        "topk_transform_paged(seq_lens)",
+        "topk_transform_paged(page_tables)",
+        "topk_transform_paged(out_page_indices)",
+        "topk_transform_paged(page_size)",
+        "topk_transform_paged(out_raw_indices)",
+    ),
+    # SGLang's indexer query at decode row counts (``_index_query``)
+    "kernels/ops/attention/dsv4/fp4_indexer_hip.py": (
+        "index_q_rope_pack_weights_flydsl",
+        "index_q_rope_pack_weights_flydsl(q)",
+        "index_q_rope_pack_weights_flydsl(freqs_cis)",
+        "index_q_rope_pack_weights_flydsl(positions)",
+        "index_q_rope_pack_weights_flydsl(rope_dim)",
+        "index_q_rope_pack_weights_flydsl(head_weight_partials)",
+        "index_q_rope_pack_weights_flydsl(weight_scale)",
+        "index_q_rope_pack_weights_flydsl(num_heads)",
+    ),
+    "kernels/ops/gemm/router_gemv_hip.py": (
+        "rocm_router_gemv_split_k",
+        "rocm_router_gemv_split_k(x)",
+        "rocm_router_gemv_split_k(w)",
+    ),
+    "kernels/ops/attention/dsv4/unified_kv_kernels/env_gate.py": (
+        "is_unified_kv_triton",
+    ),
+    "kernels/ops/layernorm/mhc.py": ("hc_broadcast", "hc_combine"),
+    "kernels/ops/layernorm/mhc_boundary_hip.py": ("tensors",),
+    "srt/arg_groups/fields/*.py": (
+        "speculative_algorithm",
+        "enable_encoder_swa_bounded_replay",
+        "fp8_gemm_runner_backend",
+        "context_length",
+    ),
+    "srt/environ.py": (
+        "envs",
+        "SGLANG_DSV4_FP4_EXPERTS",
+        "SGLANG_DSV4_FP4_DEQUANT",
+        "SGLANG_USE_AITER_MOE_GU_ITLV",
+        "SGLANG_DSV4_KV_LAYOUT",
+    ),
+    # an index source's compressor, between K1 and K2
+    "srt/layers/attention/deepseek_v4_backend.py": (
+        "forward_low_ratio_sources(layer)",
+        "forward_low_ratio_sources(x)",
+        "forward_low_ratio_sources(q_lora)",
+        "forward_low_ratio_sources(positions)",
+        "forward_low_ratio_sources(forward_batch)",
+        "forward_low_ratio_sources(run_indexer)",
+    ),
+    "srt/layers/attention/deepseek_v4_backend_hip_radix.py": (
+        "forward_low_ratio_sources",
+        "forward_metadata",
+        "core_attn_metadata",
+        "get_swa_out_cache_loc",
+        "swa_page_indices",
+        "swa_topk_lengths",
+        "sparse_page_indices",
+        "sparse_topk_lengths",
+        # its indexer's inputs and outputs: K2i stands in for its scorer
+        "low_ratio_indexer_metadata",
+        "sparse_raw_indices",
+        "drop_folded_sparse_indices",
+    ),
+    # SGLang's decode indexer: its per-step decisions
+    "srt/layers/attention/dsv4/low_ratio_backend_hip.py": (
+        "low_ratio_decode_rows_are_identity",
+        "low_ratio_decode_rows_are_identity(backend)",
+        "low_ratio_decode_rows_are_identity(forward_batch)",
+        "low_ratio_decode_rows_are_identity(ratio)",
+        "low_ratio_decode_rows_fit_candidate_span",
+        "low_ratio_decode_rows_fit_candidate_span(backend)",
+        "low_ratio_decode_rows_fit_candidate_span(forward_batch)",
+    ),
+    "srt/layers/attention/dsv4/metadata.py": (
+        "page_table",
+        "compressed_seq_lens",
+        "compressed_page_size",
+    ),
+    "srt/layers/attention/dsv4/dsv41_sparse.py": (
+        "is_candidate_source",
+        "uses_candidates",
+        "candidate_topk_blocks",
+        "candidate_block_size",
+        "n_heads",
+        "wq_b",
+        "weights_proj",
+        "weights_proj_hip_max_tokens",
+        "rope_head_dim",
+        "head_weight_scale",
+    ),
+    "srt/layers/quantization/fp8.py": (
+        "aiter_bpreshuffled",
+        "w13_weight",
+        "w2_weight",
+        "w13_weight_scale_inv",
+        '"w2_weight_scale_inv"',
+    ),
+    "srt/layers/quantization/fp8_hip.py": ("mxfp8_native_ready",),
+    "srt/layers/quantization/mxfp4.py": ("is_shuffled",),
+    "srt/layers/layer_boundary/adapters/attention.py": (
+        "get_attn_tp_context",
+        "maybe_input_scattered",
+    ),
+    "srt/layers/logits_processor.py": ("forward(hidden_states_before_norm)",),
+    "srt/mem_cache/deepseek_v4_memory_pool.py": (
+        "get_swa_raw_buffer",
+        "get_swa_key_page_size",
+        "get_extra_key_buffer",
+        "get_extra_key_page_size",
+        "get_index_k_fp4_payload_buffer",
+        "get_index_k_fp4_scale_buffer",
+        "low_ratio_index_k_is_split",
+        "get_index_k_page_size",
+    ),
+    "srt/model_executor/forward_context.py": (
+        "get_attn_backend",
+        "get_token_to_kv_pool",
+    ),
+    "srt/configs/deepseek_v4.py": ("vision_n_layers", "image_token_id"),
+    "srt/layers/engram.py": ("layer_hash_index", "forward(cp_all_tokens)"),
+    "srt/model_executor/forward_batch_info.py": ("contains_mm_inputs",),
+    "srt/models/deepseek_common/amd/deepseek_v4_hip.py": ("hc_boundary_fused",),
+    "srt/models/deepseek_v2.py": (
+        "experts",
+        "gate",
+        "e_score_correction_bias",
+        "is_nextn",
+        "is_hash",
+        "forward_normal",
+    ),
+    # DeepseekV4ForCausalLM.forward, which the routed forward stands in for
+    "srt/models/deepseek_v4.py": (
+        "prepare_language_model_inputs",
+        "logits_processor",
+        "lm_head",
+        "capture_aux_hidden_states",
+        "model",
+        "forward(input_ids)",
+        "forward(positions)",
+        "forward(forward_batch)",
+        "forward(input_embeds)",
+        "embed_tokens",
+        "hc_mult",
+        "norm",
+        "start_layer",
+        "end_layer",
+        "engram_hasher",
+        '"freqs_cis_c4"',
+        '"freqs_cis_c128"',
+        "layers",
+        "config",
+        "dspark_layers_to_capture",
+        "self_attn",
+        "mlp",
+        "engram",
+        "hc_attn_fn",
+        "hc_attn_scale",
+        "hc_attn_base",
+        "hc_ffn_fn",
+        "hc_ffn_scale",
+        "hc_ffn_base",
+        "input_layernorm",
+        "post_attention_layernorm",
+        "hc_post",
+        "compressor",
+        "indexer",
+        "q_head_norm",
+        "fuse_wqa_wkv",
+        "n_local_heads",
+        "wqkv_a",
+        "wq_b",
+        "wo_a",
+        "wo_b",
+        "q_norm",
+        "kv_norm",
+        "freqs_cis",
+        "attn_sink",
+        "compress_ratio",
+    ),
+    "srt/runtime_context.py": (
+        "get_parallel",
+        "get_model",
+        '"tp_rank"',
+        '"tp_size"',
+        '"tp_group"',
+    ),
+    "srt/utils/common.py": ("get_bool_env_var",),
+}
+
+# Per launch output against the normal path on the same GPU (the kernel tests)
+NUMERICS = Numerics(
+    NumericsKind.TOLERANCE,
+    {
+        # K1: the seam's mixes and the SWA KV records as the normal path writes them
+        "k1.kv.max_abs": 0.0,
+        "k1.mix.max_abs": 1e-6,
+        # wq_b summed in another order; bf16 rounding flips only
+        "k1.q.cosine": 0.99999,
+        "k1.q.rel": 5e-3,
+        # an index source's normed input as the normal path's norm writes it, and
+        # its qr (q_norm's sum of squares in another order: bf16 flips)
+        "k1.normed.max_abs": 0.0,
+        "k1.qr.rel": 4e-3,
+        # K2: the attention core output, wo_a's MXFP8 output and wo_b's partial
+        "k2.attn_out.cosine": 0.9998,
+        "k2.wo_a.rel": 5e-3,
+        "k2.wo_b.rel": 1e-3,
+        # the FFN launch (K2 runs the same stages)
+        "ffn.mix.rel": 1e-4,
+        "ffn.normed.cosine": 0.9999,
+        "ffn.normed.rel": 0.012,
+        "ffn.moe.cosine": 0.9999,
+        "ffn.moe.rel": 0.015,
+        # K2i: the index logits against SGLang's aiter FP4 logits, a row's largest
+        # difference over its largest logit (the per-lane FMA chain sums the heads
+        # in another rounding); a candidate consumer's top-512 of its candidate
+        # columns are the rows SGLang's top-k within the candidate blocks picks of
+        # the same logits, as sets
+        "k2i.logits.rel": 1e-5,
+        "k2i.sel.max_abs": 0.0,
+    },
+)
+
+
+def _covered_layers(config) -> list[int]:
+    """The layers K1 and K2 can run: not hash-routed, compress ratio 0, 1 or 2."""
+    first = getattr(config, "num_hash_layers", 0) or 0
+    return [
+        i
+        for i in range(first, config.num_hidden_layers)
+        if config.compress_ratios[i] in (0, 1, 2)
+    ]
+
+
+def _config_disable_reasons(cfg, hf_config) -> list[str]:
+    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        is_unified_kv_triton,
+    )
+    from sglang.srt.environ import envs
+    from sglang.srt.utils import get_bool_env_var
+
+    reasons = [
+        f"needs DeepSeek-V4.1-Flash's {key} = {want!r}"
+        for key, want in HF_CONFIG.items()
+        if getattr(hf_config, key, None) != want
+    ]
+    if hf_config.model_type != "deepseek_v41":
+        reasons.append(f"model type {hf_config.model_type!r}, needs deepseek_v41")
+    backend = cfg.fp8_gemm_runner_backend
+    if backend != "aiter":
+        # the other FP8 GEMM backends reorder wqkv_a, wq_b and wo_b in place
+        reasons.append(
+            f"--fp8-gemm-backend {backend!r}: needs aiter, which keeps the attention "
+            "weights row-major for K1 and K2"
+        )
+    algo = (cfg.speculative_algorithm or "NONE").upper()
+    if algo not in ("NONE", "DSPARK"):
+        # DSpark's target steps are uniform verify steps; other drafts differ
+        reasons.append(f"speculative algorithm {algo}: only DSpark")
+    if (
+        not envs.SGLANG_DSV4_FP4_EXPERTS.get()
+        or envs.SGLANG_DSV4_FP4_DEQUANT.get()
+        or not envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+        or get_bool_env_var("AITER_FORCE_A8W4")
+    ):
+        reasons.append(
+            "needs the MXFP4 experts in aiter's gate / up interleaved layout"
+        )
+    if is_unified_kv_triton() or cfg.enable_encoder_swa_bounded_replay:
+        reasons.append("needs the paged SWA cache, not unified_kv or a request window")
+    if envs.SGLANG_DSV4_KV_LAYOUT.get().lower() != "v4":
+        reasons.append("needs the V4 KV layout (fp8 nope, bf16 rope, 584 B a token)")
+    if importlib.util.find_spec("flydsl") is None:
+        reasons.append("needs FlyDSL")
+    return reasons
+
+
+def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
+    from sglang.srt.runtime_context import get_parallel
+
+    from sgl_amd_mono.deepseek_v41.gfx950.attention.plan import (
+        Dims,
+    )
+
+    heads = Dims(get_parallel().tp_size).heads
+    covered = _covered_layers(hf_config)
+    other = sorted(set(range(hf_config.num_hidden_layers)) - set(covered))
+    reasons = [f"layers {other}: no kernels (hash-routed, or another compress ratio)"]
+    reasons, unseen = reasons if other else [], []
+    for i in covered:
+        layer = model.model.layers[i]
+        a, moe = layer.self_attn, layer.mlp
+        if not layer.hc_boundary_fused or moe.is_nextn or moe.is_hash:
+            reasons.append(f"layer {i}: needs the fused mHC boundary and a routed MoE")
+        if not getattr(moe.experts.w13_weight, "is_shuffled", False):
+            reasons.append(f"layer {i}: MoE weights not in aiter's shuffle")
+        if any(
+            ("shared expert fp8", i, p, k) not in copies
+            for p in _SHARED
+            for k in ("weight", "scale")
+        ):
+            unseen.append(i)
+        if a.q_head_norm or not a.fuse_wqa_wkv or a.n_local_heads != heads:
+            reasons.append(
+                f"layer {i}: K1 needs the fused wqkv_a, {heads} local heads and no "
+                "q head norm"
+            )
+        if (a.compressor is not None or a.indexer is not None) and (
+            a.compress_ratio not in (1, 2)
+        ):
+            reasons.append(
+                f"layer {i}: a compressor or indexer at compress ratio "
+                f"{a.compress_ratio}; SGLang's low-ratio sources serve ratio 1 or 2"
+            )
+        reasons += _indexer_reasons(i=i, attn=a)
+        if any(
+            getattr(lin, "aiter_bpreshuffled", False)
+            or getattr(lin, "mxfp8_native_ready", False)
+            for lin in (a.wqkv_a, a.wq_b, a.wo_a, a.wo_b)
+        ):
+            reasons.append(
+                f"layer {i}: an FP8 linear method reordered an attention weight in "
+                "place; K1 and K2 read them row-major"
+            )
+    if unseen:
+        reasons.append(
+            "the shared expert's FP8 checkpoint tensors were not seen at load "
+            f"(layers {unseen})"
+        )
+    return reasons
+
+
+def _indexer_reasons(*, i: int, attn) -> list[str]:
+    """What K2i needs of layer i's indexer past ``HF_CONFIG``: a candidate source's
+    blocks (optional HF-config keys, so read off the indexer), and SGLang's
+    decode-row query path, which ``_index_query`` runs."""
+    ix = attn.indexer
+    if ix is None:
+        return []
+    reasons = []
+    if (ix.is_candidate_source or ix.uses_candidates) and (
+        ix.candidate_topk_blocks,
+        ix.candidate_block_size,
+    ) != (CANDIDATES["candidate_topk_blocks"], CANDIDATES["candidate_block_size"]):
+        reasons.append(f"layer {i}: K2i scores candidate blocks of 2048 x 8 rows")
+    if ix.weights_proj_hip_max_tokens < MAX_ROWS or attn.freqs_cis.dtype != (
+        torch.complex64
+    ):
+        reasons.append(
+            f"layer {i}: K2i's query needs SGLang's split-K head-weight GEMV for "
+            f"{MAX_ROWS} rows and a complex64 RoPE table"
+        )
+    return reasons
+
+
+def _load_tensor(copies: dict, model, name: str, tensor: torch.Tensor) -> None:
+    """Keep this rank's shard of each covered layer's FP8 shared expert, by its
+    checkpoint name (``layers.{i}.ffn.shared_experts.{w1,w2,w3}.{weight,scale}``;
+    the checkpoint's ``mtp.*`` layers do not match)."""
+    from sglang.srt.runtime_context import get_parallel
+
+    m = _CKPT_SHARED.fullmatch(name)
+    if m is None or int(m["i"]) not in _covered_layers(model.config):
+        return
+    i, proj = int(m["i"]), _CKPT_PROJ[m["w"]]
+    p = get_parallel()
+    dim = 1 if proj == "down_proj" else 0  # the TP-sharded intermediate dimension
+    t = tensor.view(torch.uint8)
+    n = t.shape[dim] // p.tp_size
+    shard = t.narrow(dim, p.tp_rank * n, n).to(torch.cuda.current_device())
+    copies["shared expert fp8", i, proj, m["kind"]] = shard.contiguous()
+
+
+class _Layer(msgspec.Struct):
+    """One covered layer: its module and weights, and its caches (bound at the
+    layer's first launch)."""
+
+    i: int
+    module: Any
+    ffn: Any  # FFNWeights
+    k1: Any = None  # K1Weights
+    k2: Any = None  # K2Weights
+    ratio: int = 0  # the compress ratio: which sparse key table K1 reads (0: none)
+    # an index source: SGLang's compressor and indexer run between K1 and K2
+    index: bool = False
+    swa: Any = None  # the SWA cache, uint8 [pages, page bytes]
+    swa_block: int = 0
+    comp: Any = None  # the compressed cache, the same layout
+    comp_block: int = 0
+    plane: Any = None  # an indexer's FP4 index plane: (payload, scales)
+
+
+def _keep(copies: dict, t: torch.Tensor, *key) -> torch.Tensor:
+    copies[key] = t
+    return t
+
+
+def _codes(copies: dict, i: int, name: str, lin) -> torch.Tensor:
+    from sgl_amd_mono.deepseek_v41.gfx950.weights import e8m0
+
+    return _keep(
+        copies,
+        e8m0(lin.weight_scale_inv, f"layer {i} {name}"),
+        "e8m0 scale codes",
+        i,
+        name,
+    )
+
+
+def _weights(copies: dict, tables: list, layer, i: int) -> _Layer:
+    """Layer i's tensors as the launches read them."""
+    from sglang.srt.runtime_context import get_parallel
+
+    from sgl_amd_mono.deepseek_v41.gfx950.attention.plan import (
+        Dims,
+    )
+    from sgl_amd_mono.deepseek_v41.gfx950.runner import (
+        FFNWeights,
+        K1Weights,
+        K2Weights,
+    )
+    from sgl_amd_mono.deepseek_v41.gfx950.weights import (
+        mxfp8_exact,
+        rope_table,
+    )
+
+    p, a, moe = get_parallel(), layer.self_attn, layer.mlp
+    d, e, u8, e4m3 = Dims(p.tp_size), moe.experts, torch.uint8, torch.float8_e4m3fn
+    n = moe.gate.weight.shape[0]  # the routed experts, before a fused shared one
+
+    def gate_up(kind):  # the shared expert's gate and up projections, one tensor
+        parts = [copies.pop(("shared expert fp8", i, q, kind)) for q in _SHARED[:2]]
+        return _keep(copies, torch.cat(parts), "shared expert fp8", i, "gate_up", kind)
+
+    def down(kind):
+        return copies["shared expert fp8", i, "down_proj", kind]
+
+    ffn = FFNWeights(
+        hc_ffn_fn=layer.hc_ffn_fn,
+        hc_ffn_scale=layer.hc_ffn_scale,
+        hc_ffn_base=layer.hc_ffn_base,
+        ffn_norm=layer.post_attention_layernorm.weight,
+        gate_w=moe.gate.weight,
+        bias=_keep(
+            copies, moe.gate.e_score_correction_bias.float(), "f32 router bias", i
+        ),
+        w13=e.w13_weight[:n],
+        w13_s=e.w13_weight_scale_inv.view(u8)[: n * e.w13_weight.shape[1]],
+        w2=e.w2_weight[:n],
+        w2_s=e.w2_weight_scale_inv.view(u8)[: n * e.w2_weight.shape[1]],
+        sgu=gate_up("weight").view(e4m3),
+        sgu_s=gate_up("scale"),
+        sw2=down("weight").view(e4m3),
+        sw2_s=down("scale"),
+    )
+    ffn.check(p.tp_size, n)
+    L = _Layer(i, layer, ffn)
+    if a.fuse_wqa_wkv:
+        wqkv, wqkv_s = a.wqkv_a.weight, _codes(copies, i, "wqkv_a", a.wqkv_a)
+    else:  # the DSpark draft's wq_a and wkv as K1's one weight (a copy)
+        u8 = [lin.weight.view(torch.uint8) for lin in (a.wq_a, a.wkv)]
+        wqkv = _keep(copies, torch.cat(u8).view(a.wq_a.weight.dtype), "wqkv fp8", i)
+        wqkv_s = _keep(
+            copies,
+            torch.cat(
+                [
+                    _codes({}, i, n_, lin)
+                    for n_, lin in (("wq_a", a.wq_a), ("wkv", a.wkv))
+                ]
+            ),
+            "e8m0 scale codes",
+            i,
+            "wqkv",
+        )
+    cos_sin = rope_table(a.freqs_cis, tables)
+    L.k1 = K1Weights(
+        hc_fn=layer.hc_attn_fn,
+        hc_scale=layer.hc_attn_scale,
+        hc_base=layer.hc_attn_base,
+        norm=layer.input_layernorm.weight,
+        wqkv=wqkv,
+        wqkv_s=wqkv_s,
+        q_norm=a.q_norm.weight,
+        kv_norm=a.kv_norm.weight,
+        wqb=a.wq_b.weight,
+        wqb_s=_codes(copies, i, "wq_b", a.wq_b),
+        cos_sin=cos_sin,
+    )
+    L.k1.check(d)
+    if a.wo_a.weight.dtype == e4m3:
+        woa, woa_s = a.wo_a.weight, _codes(copies, i, "wo_a", a.wo_a)
+    else:  # SGLang dequantized the checkpoint's FP8 wo_a to bf16 at load
+        woa, woa_s = mxfp8_exact(
+            a.wo_a.weight.reshape(d.groups * 1024, d.group_k), f"layer {i} wo_a"
+        )
+        _keep(copies, woa, "wo_a mxfp8", i, "weight")
+        _keep(copies, woa_s, "wo_a mxfp8", i, "scale")
+    sink = a.attn_sink.detach()[p.tp_rank * d.heads : (p.tp_rank + 1) * d.heads]
+    L.k2 = K2Weights(
+        woa=woa,
+        woa_s=woa_s,
+        wob=a.wo_b.weight,
+        wob_s=_codes(copies, i, "wo_b", a.wo_b),
+        sink=_keep(copies, sink.float().contiguous(), "f32 attention sinks", i),
+        cos_sin=cos_sin,
+    )
+    L.k2.check(d)
+    L.ratio = a.compress_ratio
+    L.index = a.compressor is not None or a.indexer is not None
+    return L
+
+
+def _boundary_out(layer, defer_post, x, residual, post, comb, pre):
+    """What the fused boundary returns: (hidden_states, pre, pending post); with
+    ``defer_post`` this layer's post stays pending for the next layer."""
+    post = post.view(post.shape[0], -1)
+    if defer_post:
+        return None, pre, (x, residual, post, comb)
+    return layer.hc_post(x, residual, post, comb), pre, None
+
+
+def _launch(
+    runner, L, plan, positions, forward_batch, pending_post, prev_pre, capture=None
+):
+    """K1, then K2, of layer ``L``: the previous layer's pending post (x, residual,
+    post, comb) and pre in; K2's (x, residual, post, comb, pre) out, this layer's
+    post pending. With no post owed (x None) the residual arrives settled: the
+    first layer's broadcast embedding (no pre: copy 0), an Engram layer's
+    residual, or a draft stage's input."""
+    from sglang.srt.model_executor.forward_context import (
+        get_attn_backend,
+        get_token_to_kv_pool,
+    )
+
+    x, residual, post, comb = pending_post
+    if L.swa is None:  # the layer's caches, at its first launch
+        pool = get_token_to_kv_pool()
+        L.swa, L.swa_block = pool.get_swa_raw_buffer(L.i), pool.get_swa_key_page_size()
+        if L.ratio:
+            # SGLang types the compressed cache as e4m3; K2 addresses its records' bytes
+            L.comp = pool.get_extra_key_buffer(L.i).view(torch.uint8)
+            L.comp_block = pool.get_extra_key_page_size(L.i)
+    backend, M = get_attn_backend(), residual.shape[0]
+    if "k1" not in plan.state:
+        # the forward's first K1 converts them; a graph records the copies
+        slot = backend.get_swa_out_cache_loc(forward_batch)
+        plan.state["k1"] = (
+            positions[:M].long().contiguous(),
+            slot[:M].long().contiguous(),
+        )
+    pos, slot = plan.state["k1"]
+    md = backend.forward_metadata.core_attn_metadata
+    if L.ratio:  # the top-k of the layer's index source (its own, after K1)
+        topk = (md.sparse_page_indices(L.ratio), md.sparse_topk_lengths(L.ratio))
+    else:  # the window only
+        topk = (runner.no_topk, runner.no_topk_lens)
+    keys = (md.swa_page_indices, md.swa_topk_lengths, *topk)
+    if x is None:
+        residual = residual.contiguous()  # the broadcast embedding may be a view
+        if prev_pre is None:
+            prev_pre = runner.first_pre[:M]
+    _, res_mid, *_ = runner.k1(
+        L.k1, x, residual, post, comb, prev_pre, pos, slot, L.swa, L.swa_block,
+        keys, index=L.index,
+    )  # fmt: skip
+    if capture is not None:
+        capture(L, res_mid)
+    if L.index:
+        _select(
+            runner=runner, L=L, plan=plan, backend=backend, positions=positions,
+            pos=pos, forward_batch=forward_batch, M=M,
+        )  # fmt: skip
+    # K2 reads K1's outputs from the runner's buffers
+    return runner.k2(
+        L.k2, L.ffn, M, pos, L.swa, L.swa_block, L.comp, L.comp_block,
+        slot=slot, keys=keys, index=L.index,
+    )  # fmt: skip
+
+
+def _select(*, runner, L, plan, backend, positions, pos, forward_batch, M) -> None:
+    """An index source between K1 and K2. SGLang's compressor runs on K1's normed
+    input, as SGLang's low-ratio path runs it before the attention (the KV sources;
+    the other index sources read their keys). Then the layer's top-512 lands in
+    SGLang's sparse indices of its ratio as SGLang's decode indexer
+    (``low_ratio_index_topk_hip_decode``) decides, from SGLang's own functions (a
+    captured variant's answer under a graph): every row in order where SGLang
+    scores nothing; else K2i's logits of SGLang's query, then SGLang's top-k
+    kernels (``K2iRunner.select``): a FULL step's every layer, or on a two-level
+    step the candidate source (``producer``) and the layers after it inside its
+    blocks (``reindex``)."""
+    from sglang.kernels.ops.attention.dsv4 import topk_transform_paged
+    from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
+        low_ratio_decode_rows_are_identity,
+        low_ratio_decode_rows_fit_candidate_span,
+    )
+
+    attn, r = L.module.self_attn, L.ratio
+    if attn.compressor is not None:
+        backend.forward_low_ratio_sources(
+            layer=attn,
+            x=runner.normed[:M],
+            q_lora=None,
+            positions=positions,
+            forward_batch=forward_batch,
+            run_indexer=False,
+        )
+    ix = attn.indexer
+    if ix is None:
+        return
+    fm = backend.forward_metadata
+    core, meta = fm.core_attn_metadata, fm.low_ratio_indexer_metadata(r)
+    page_idx, raw_idx = core.sparse_page_indices(r), core.sparse_raw_indices(r)
+    # as SGLang's indexer: it rewrites this ratio's indices in place
+    core.drop_folded_sparse_indices(r)
+    if low_ratio_decode_rows_are_identity(
+        backend=backend, forward_batch=forward_batch, ratio=r
+    ):
+        # every row sees at most index_topk rows: its top-k is every row, in order
+        topk_transform_paged(
+            scores=torch.empty(
+                (page_idx.shape[0], 1), dtype=torch.float32, device=page_idx.device
+            ),
+            seq_lens=meta.compressed_seq_lens,
+            page_tables=meta.page_table,
+            out_page_indices=page_idx,
+            page_size=meta.compressed_page_size,
+            out_raw_indices=raw_idx,
+        )
+        return
+    two_level = (
+        ix.is_candidate_source or ix.uses_candidates
+    ) and not low_ratio_decode_rows_fit_candidate_span(
+        backend=backend, forward_batch=forward_batch
+    )
+    kind = "full" if not two_level else "reindex" if ix.uses_candidates else "producer"
+    if L.plane is None:  # the layer's index plane, at its first launch (eager)
+        L.plane = _index_plane(L=L, M=M, meta=meta, raw_idx=raw_idx)
+    bounds = meta.compressed_seq_lens
+    if bounds.dtype != torch.int32 or not bounds.is_contiguous():
+        bounds = bounds.to(torch.int32).contiguous()
+    k2i, per_req = runner.k2i, plan.key.tokens_per_request
+    if kind != "reindex" and ("k2i plan", r) not in plan.state:
+        # the step's walk plan of this ratio: its FULL and producer layers share it
+        k2i.walk_plan(ratio=r, bounds=bounds, rows=M, per_req=per_req)
+        plan.state["k2i plan", r] = True
+    published = k2i.select(
+        kind=kind,
+        rows=M,
+        per_req=per_req,
+        ratio=r,
+        query=_index_query(
+            attn=attn, x=runner.normed[:M], q_lora=runner.qr[:M], positions=pos
+        ),
+        plane=L.plane,
+        page_table=meta.page_table,
+        bounds=bounds,
+        raw_out=raw_idx,
+        page_out=page_idx,
+        # the candidate source's blocks of this step, for the layers after it
+        candidates=plan.state["k2i candidates"] if kind == "reindex" else None,
+    )
+    if kind == "producer":
+        plan.state["k2i candidates"] = published
+
+
+def _index_query(*, attn, x, q_lora, positions) -> tuple:
+    """SGLang's indexer query for decode rows (``low_ratio_backend_hip``'s split-K
+    GEMV path, its path at K2i's row counts): the FP4 query, its scales and the
+    scaled bf16 head weights."""
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+        index_q_rope_pack_weights_flydsl,
+    )
+    from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_gemv_split_k
+
+    ix = attn.indexer
+    q, _ = ix.wq_b(q_lora)
+    return index_q_rope_pack_weights_flydsl(
+        q=q,
+        freqs_cis=attn.freqs_cis,
+        positions=positions,
+        rope_dim=ix.rope_head_dim,
+        head_weight_partials=rocm_router_gemv_split_k(x=x, w=ix.weights_proj.weight),
+        weight_scale=ix.head_weight_scale,
+        num_heads=ix.n_heads,
+    )
+
+
+def _index_plane(*, L, M: int, meta, raw_idx) -> tuple:
+    """The layer's FP4 index plane, after the checks K2i needs of SGLang's index
+    cache (it exists only after the forward's KV sizing, so not at attach)."""
+    from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+
+    from sgl_amd_mono.deepseek_v41.gfx950.indexer.runner import (
+        PLANE_ROWS,
+        check_plane,
+    )
+
+    pool = get_token_to_kv_pool()
+    reasons = []
+    if not pool.low_ratio_index_k_is_split(L.i):
+        reasons.append("the index keys are not in the split FP4 plane")
+    if pool.get_index_k_page_size(L.ratio) != PLANE_ROWS:
+        reasons.append(f"index pages of {pool.get_index_k_page_size(L.ratio)} rows")
+    if meta.compressed_page_size != PLANE_ROWS or meta.page_table.shape[0] != M:
+        reasons.append(
+            f"an index page table of {tuple(meta.page_table.shape)} at "
+            f"{meta.compressed_page_size} rows a page, for {M} rows"
+        )
+    if raw_idx is None:
+        reasons.append("no sparse_raw_indices for the step")
+    if reasons:
+        raise RuntimeError(
+            f"monokernel: layer {L.i}: K2i needs SGLang's FP4 index plane of "
+            f"{PLANE_ROWS}-row pages: " + "; ".join(reasons)
+        )
+    payload = pool.get_index_k_fp4_payload_buffer(L.i)
+    scale = pool.get_index_k_fp4_scale_buffer(L.i)
+    check_plane(payload=payload, scale=scale)
+    return payload.view(torch.uint8), scale
+
+
+class _Built:
+    """One rank's monokernels: the runner, each layer's weights, and the forward."""
+
+    def __init__(self, lm, runner, layers: dict):
+        self.lm, self.model, self.runner, self._layers = lm, lm.model, runner, layers
+        self._normal_moe = lm.model.layers[min(layers)].mlp
+
+    def serves(self, key) -> bool:
+        """Every decode and DSpark verify step of a built width."""
+        return key.forward_mode in ("decode", "target_verify")
+
+    def forward(
+        self, plan, input_ids, positions, forward_batch, input_embeds=None, *_, **__
+    ):
+        """``DeepseekV4ForCausalLM.forward`` for a routed step: SGLang's input
+        preparation and logits processor around the backbone."""
+        from sglang.srt.layers.layer_boundary import get_attn_tp_context
+
+        lm = self.lm
+        input_ids, input_embeds = lm.prepare_language_model_inputs(
+            input_ids, forward_batch, input_embeds
+        )
+        with get_attn_tp_context().maybe_input_scattered(forward_batch):
+            out = self._backbone(
+                plan, input_ids, positions, forward_batch, input_embeds
+            )
+        aux = None
+        if lm.capture_aux_hidden_states:
+            out, aux = out
+        hidden, pre_hc_head = out
+        return lm.logits_processor(
+            input_ids,
+            hidden,
+            lm.lm_head,
+            forward_batch,
+            aux,
+            hidden_states_before_norm=None if aux is not None else pre_hc_head,
+        )
+
+    def _backbone(self, plan, input_ids, positions, forward_batch, input_embeds):
+        """``DeepseekV4Model.forward``: the embedding, each layer as K1 and K2,
+        SGLang's Engram writes, then the head's combine and norm."""
+        from sglang.kernels.ops.layernorm.mhc import hc_broadcast, hc_combine
+
+        m = self.model
+        self._warm_normal_moe()
+        x = m.embed_tokens(input_ids) if input_embeds is None else input_embeds
+        # the compressor caches each step's rotary tables on the batch
+        for attr in ("freqs_cis_c4", "freqs_cis_c128"):
+            if hasattr(forward_batch, attr):
+                delattr(forward_batch, attr)
+        hash_ids = None
+        if m.engram_hasher is not None:
+            hash_ids = m.engram_hasher(input_ids, forward_batch)
+        aux = None if m.dspark_layers_to_capture is None else []
+        plan.state["dspark_aux"] = aux
+        pending, pre = (None, hc_broadcast(x, m.hc_mult), None, None), None
+        for i in range(m.start_layer, m.end_layer):
+            engram = m.layers[i].engram
+            if engram is not None:  # on the residual the last layer settled
+                before = pending[1]
+                residual = engram(
+                    before, hash_ids[:, engram.layer_hash_index], forward_batch
+                )
+                if m.config.vision_n_layers > 0 and forward_batch.contains_mm_inputs():
+                    image = input_ids == m.config.image_token_id
+                    residual = torch.where(image[:, None, None], before, residual)
+                pending = (None, residual, None, None)
+            # an Engram layer reads the settled residual: no post owed into it
+            defer = i + 1 < m.end_layer and m.layers[i + 1].engram is None
+            hidden, pre, post = self._layer(
+                self._layers[i], plan, positions, forward_batch, pending, pre, defer
+            )
+            pending = post if defer else (None, hidden, None, None)
+        residual = pending[1]
+        pre_hc_head = residual.flatten(1)
+        hidden = m.norm(hc_combine(pre_hc_head.float(), pre, m.hc_mult, residual.dtype))
+        if aux is not None:
+            return (hidden, pre_hc_head), aux
+        return hidden, pre_hc_head
+
+    def _layer(
+        self, L, plan, positions, forward_batch, pending_post, prev_pre, defer_post
+    ):
+        """One layer: the previous layer's pending post (x, residual, post, comb)
+        and pre in; the fused boundary's outputs out."""
+        self._warm_normal_moe()
+        out = _launch(
+            self.runner, L, plan, positions, forward_batch, pending_post, prev_pre,
+            capture=lambda L, residual: self._capture(plan, L, residual),
+        )  # fmt: skip
+        return _boundary_out(L.module, defer_post, *out)
+
+    def _capture(self, plan, L, residual) -> None:
+        """DSpark reads the mean of each target layer's input residual."""
+        targets = self.model.dspark_layers_to_capture
+        if targets is not None and L.i in targets:
+            plan.state["dspark_aux"].append(residual.mean(dim=1))
+
+    def _warm_normal_moe(self) -> None:
+        """At the first eager forward, run the normal MoE at 1 to MAX_ROWS rows: the
+        decode graphs no longer run it, so no later extend step compiles its
+        kernels (per rank, no collective)."""
+        moe = self._normal_moe
+        if moe is None or torch.cuda.is_current_stream_capturing():
+            return
+        self._normal_moe = None
+        x = torch.randn(
+            MAX_ROWS,
+            HF_CONFIG["hidden_size"],
+            dtype=torch.bfloat16,
+            device=self.runner.device,
+        )
+        for m in range(1, MAX_ROWS + 1):
+            moe.forward_normal(x[:m], return_moe_output=True)
+
+
+def _longest_context(hf_config) -> int:
+    """The longest context a request can have: ``--context-length``, else the
+    model's; a ratio-1 index source sees that many compressed rows (plus a
+    verify step's draft rows)."""
+    from sglang.srt.runtime_context import get_model
+
+    ctx = get_model().context_length or hf_config.max_position_embeddings
+    return int(ctx) + 2 * MAX_ROWS
+
+
+def _build(model, hf_config, ctx) -> _Built:
+    from sglang.srt.runtime_context import get_parallel
+
+    from sgl_amd_mono.deepseek_v41.gfx950.runner import (
+        DSV41MonoRunner,
+    )
+
+    first = len(ROPE_TABLES)
+    layers = {
+        i: _weights(ctx.copies, ROPE_TABLES, model.model.layers[i], i)
+        for i in _covered_layers(hf_config)
+    }
+    for n, (_, t) in enumerate(ROPE_TABLES[first:], first):
+        ctx.copies["rope table", n] = t
+    # the peer handshake is collective: every rank gets here (attach agreed first)
+    p = get_parallel()
+    device = model.model.layers[0].input_layernorm.weight.device
+    runner = DSV41MonoRunner(p.tp_size, p.tp_rank, p.tp_group.cpu_group, device)
+    runner.set_deadline(ctx.deadline_s)
+    k2i = any(L.module.self_attn.indexer is not None for L in layers.values())
+    if k2i:
+        # the indexer's buffers, sized here: before SGLang sizes the KV cache
+        runner.enable_k2i(_longest_context(hf_config))
+    # K1 with and without the owed post (the residual arrives settled on the
+    # first layer and after an Engram write), K2 with and without top-k rows
+    k1 = {(fold, L.index) for L in layers.values() for fold in (True, False)}
+    k2 = {(L.ratio > 0, L.index) for L in layers.values()}
+    # Every rank builds every width. FlyDSL's disk cache hands a rank the kernels
+    # another rank built (a lock per kernel), so each rank starts at its own share.
+    widths = list(ctx.widths)
+    start = len(widths) * p.tp_rank // p.tp_size
+    for m in widths[start:] + widths[:start]:
+        runner.precompile(m, k1=k1, k2=k2, k2i=k2i)
+    return _Built(model, runner, layers)
+
+
+SPEC = MonoSpec(
+    name="deepseek_v41_hip",
+    devices={
+        "gfx950": DeviceLimits(
+            widths=tuple(range(1, MAX_ROWS + 1)),
+            tp_sizes=(2, 4),
+            resident_blocks=BLOCKS,
+        )
+    },
+    features=frozenset({Feature.SPECULATIVE_DECODING}),
+    requires=Requirements(
+        dtypes=frozenset({"bfloat16"}),
+        kv_cache_dtypes=frozenset({"fp8_e4m3"}),
+        attention_backends=frozenset({"dsv4"}),
+        moe_runner_backends=frozenset({"auto", "aiter"}),
+    ),
+    numerics=NUMERICS,
+    config_disable_reasons=_config_disable_reasons,
+    model_disable_reasons=_model_disable_reasons,
+    build=_build,
+    api=1,  # sglang.srt.monokernels.spec.API_VERSION
+    load_tensor=_load_tensor,
+)

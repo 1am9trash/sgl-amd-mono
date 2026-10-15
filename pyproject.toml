@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sgl-amd-mono"
+version = "0.1.0.dev0"
+description = "Monokernels for SGLang on AMD Instinct GPUs"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+# SGLang, torch, FlyDSL and aiter come from SGLang's ROCm image
+dependencies = []
+
+# SGLang loads the package as a general plugin, which registers its specs
+[project.entry-points."sglang.srt.plugins"]
+sgl_amd_mono = "sgl_amd_mono:register_specs"
+
+[tool.setuptools.packages.find]
+include = ["sgl_amd_mono*"]

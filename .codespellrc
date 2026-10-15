@@ -1,0 +1,3 @@
+[codespell]
+ignore-words-list = fo,te,nd,inout
+skip = *.json, *.jsonl, *.patch, *.txt, *.lock

@@ -1,0 +1,251 @@
+# SPDX-License-Identifier: Apache-2.0
+"""DeepSeek-V4.1-Flash's DSpark draft on gfx950: its spec and forward (RFC #43949).
+
+SGLang attaches the draft model as it does the target: a routed draft step (a
+block of rows a request, run as a TARGET_VERIFY batch) runs ``_Draft.forward``,
+which takes and returns what ``DeepseekV4ForCausalLMDSpark.forward`` does. Each
+stage is the target's K1 and K2 on the draft's route (128 experts, top-3, a FP4
+group an ug task) and window (the 128-token window plus the block's keys), then
+SGLang's ``hc_post``; the head's combine reads the last stage's pre, as SGLang's
+forward does. The stages' seams follow the fused mHC boundary's arithmetic where
+SGLang's draft runs the unfused one: within the kernels' bounds, so DSpark's
+acceptance with and without the switch is the gate.
+"""
+
+from __future__ import annotations
+
+import re
+
+import torch
+from sglang.srt.monokernels.spec import (
+    DeviceLimits,
+    Feature,
+    MonoSpec,
+)
+
+from sgl_amd_mono.common.plan import BLOCKS
+from sgl_amd_mono.deepseek_v41 import spec as target
+
+EXPERTS, TOPK, UG_GROUPS = 128, 3, 1  # the draft's route; a FP4 group an ug task
+WINDOW, SWA_WIDTH = 128, 192  # a row's window index slots: the window + the block
+# the checkpoint's draft stages are mtp.{stage}
+_CKPT_SHARED = re.compile(
+    r"mtp\.(?P<i>\d+)\.ffn\.shared_experts\.(?P<w>w[123])\.(?P<kind>weight|scale)"
+)
+
+# The SGLang names this module reads, by file under the sglang package (``f(p)``: a
+# parameter, ``"x"``: a string literal); test/unit/test_contract.py pins them.
+SGLANG_READS = {
+    "srt/monokernels/spec.py": ("DeviceLimits", "Feature", "MonoSpec"),
+    "kernels/ops/layernorm/mhc.py": ("hc_combine",),
+    "srt/environ.py": ("envs", "SGLANG_DSPARK_EMBED_IN_GRAPH"),
+    "srt/layers/logits_processor.py": (
+        "LogitsProcessorOutput",
+        "next_token_logits",
+        "hidden_states",
+    ),
+    # DeepseekV4ForCausalLMDSpark.forward, which the routed forward stands in for
+    "srt/models/deepseek_v4_dspark.py": (
+        "forward(input_ids)",
+        "forward(positions)",
+        "forward(forward_batch)",
+        "forward(input_embeds)",
+        "stages",
+        "forward_embed",
+        "hc_mult",
+        "hc_pre_from_prev_sublayer",
+        "sample_from_anchor",
+        '"dspark_n_routed_experts"',
+        '"dspark_num_experts_per_tok"',
+    ),
+    "srt/models/deepseek_v4.py": (
+        "wq_a",
+        "wkv",
+        "fuse_wqa_wkv",
+        "q_head_norm",
+        "n_local_heads",
+        "compress_ratio",
+    ),
+    "srt/runtime_context.py": ("get_parallel", "get_spec", '"tp_group"'),
+    "srt/speculative/dspark_components/dspark_config.py": (
+        "dspark_gamma_from_num_draft_tokens",
+    ),
+}
+
+
+def _tokens_per_request(model) -> int:
+    """A draft block's rows a request: gamma, or gamma + 1 without the anchor."""
+    from sglang.srt.runtime_context import get_spec
+    from sglang.srt.speculative.dspark_components.dspark_config import (
+        dspark_gamma_from_num_draft_tokens,
+    )
+
+    gamma = dspark_gamma_from_num_draft_tokens(
+        int(get_spec().speculative_num_draft_tokens)
+    )
+    return gamma if model.sample_from_anchor else gamma + 1
+
+
+def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
+    from sglang.srt.environ import envs
+    from sglang.srt.runtime_context import get_parallel
+
+    from sgl_amd_mono.deepseek_v41.gfx950.attention.plan import Dims
+
+    reasons, unseen = [], []
+    route = (
+        getattr(hf_config, "dspark_n_routed_experts", None),
+        getattr(hf_config, "dspark_num_experts_per_tok", None),
+    )
+    if route != (EXPERTS, TOPK):
+        reasons.append(
+            f"draft route {route}: the kernels take {EXPERTS} experts, top-{TOPK}"
+        )
+    rows = _tokens_per_request(model)
+    if WINDOW + rows > SWA_WIDTH:
+        reasons.append(f"a draft block of {rows} rows past {SWA_WIDTH} window slots")
+    if not getattr(model, "hc_pre_from_prev_sublayer", False):
+        reasons.append("needs V4.1's mHC hand-off between stages")
+    if not envs.SGLANG_DSPARK_EMBED_IN_GRAPH.get():
+        reasons.append(
+            "needs SGLANG_DSPARK_EMBED_IN_GRAPH: the forward embeds the block"
+        )
+    heads = Dims(get_parallel().tp_size).heads
+    for i, stage in enumerate(model.stages):
+        a, moe = stage.self_attn, stage.mlp
+        if a.compress_ratio != 0 or a.q_head_norm or a.n_local_heads != heads:
+            reasons.append(
+                f"stage {i}: needs a window-only attention with {heads} local heads "
+                "and no q head norm"
+            )
+        if moe.gate.weight.shape[0] != EXPERTS or not getattr(
+            moe.experts.w13_weight, "is_shuffled", False
+        ):
+            reasons.append(f"stage {i}: needs {EXPERTS} experts in aiter's shuffle")
+        linears = [a.wqkv_a] if a.fuse_wqa_wkv else [a.wq_a, a.wkv]
+        if any(
+            getattr(lin, "aiter_bpreshuffled", False)
+            or getattr(lin, "mxfp8_native_ready", False)
+            for lin in linears + [a.wq_b, a.wo_a, a.wo_b]
+        ):
+            reasons.append(
+                f"stage {i}: an FP8 linear method reordered an attention weight in "
+                "place; K1 and K2 read them row-major"
+            )
+        if any(
+            ("shared expert fp8", i, p, k) not in copies
+            for p in target._SHARED
+            for k in ("weight", "scale")
+        ):
+            unseen.append(i)
+    if unseen:
+        reasons.append(
+            "the shared expert's FP8 checkpoint tensors were not seen at load "
+            f"(stages {unseen})"
+        )
+    return reasons
+
+
+def _load_tensor(copies: dict, model, name: str, tensor: torch.Tensor) -> None:
+    """Keep this rank's shard of each stage's FP8 shared expert, by its checkpoint
+    name (``mtp.{stage}.ffn.shared_experts.{w1,w2,w3}.{weight,scale}``)."""
+    from sglang.srt.runtime_context import get_parallel
+
+    m = _CKPT_SHARED.fullmatch(name)
+    if m is None or int(m["i"]) >= len(model.stages):
+        return
+    i, proj = int(m["i"]), target._CKPT_PROJ[m["w"]]
+    p = get_parallel()
+    dim = 1 if proj == "down_proj" else 0  # the TP-sharded intermediate dimension
+    t = tensor.view(torch.uint8)
+    n = t.shape[dim] // p.tp_size
+    shard = t.narrow(dim, p.tp_rank * n, n).to(torch.cuda.current_device())
+    copies["shared expert fp8", i, proj, m["kind"]] = shard.contiguous()
+
+
+class _Draft:
+    """One rank's draft monokernels: its runner, each stage's weights, the forward."""
+
+    def __init__(self, lm, runner, stages: list):
+        self.lm, self.runner, self.stages = lm, runner, stages
+
+    def serves(self, key) -> bool:
+        """Every draft block of a built width."""
+        return key.forward_mode == "target_verify"
+
+    def forward(
+        self, plan, input_ids, positions, forward_batch, input_embeds=None, *_, **__
+    ):
+        """``DeepseekV4ForCausalLMDSpark.forward`` for a routed draft step."""
+        from sglang.kernels.ops.layernorm.mhc import hc_combine
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
+        lm = self.lm
+        x = lm.forward_embed(input_ids) if input_embeds is None else input_embeds
+        pre = None
+        for L in self.stages:  # each stage settles its post: what SGLang's returns
+            out = target._launch(
+                self.runner,
+                L,
+                plan,
+                positions,
+                forward_batch,
+                (None, x, None, None),
+                pre,
+            )
+            x, pre, _ = target._boundary_out(L.module, False, *out)
+        x = hc_combine(x.flatten(1).float(), pre, lm.hc_mult, x.dtype)
+        return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
+
+
+def _build(model, hf_config, ctx) -> _Draft:
+    from sglang.srt.runtime_context import get_parallel
+
+    from sgl_amd_mono.deepseek_v41.gfx950.runner import DSV41MonoRunner
+
+    first = len(target.ROPE_TABLES)
+    stages = [
+        target._weights(ctx.copies, target.ROPE_TABLES, stage, i)
+        for i, stage in enumerate(model.stages)
+    ]
+    for n, (_, t) in enumerate(target.ROPE_TABLES[first:], first):
+        ctx.copies["rope table", n] = t
+    p = get_parallel()
+    runner = DSV41MonoRunner(
+        p.tp_size,
+        p.tp_rank,
+        p.tp_group.cpu_group,
+        model.stages[0].input_layernorm.weight.device,
+        experts=EXPERTS,
+        topk=TOPK,
+        ug_groups=UG_GROUPS,
+        swa_width=SWA_WIDTH,
+    )
+    runner.set_deadline(ctx.deadline_s)
+    widths = list(ctx.widths)
+    start = len(widths) * p.tp_rank // p.tp_size
+    for m in widths[start:] + widths[:start]:
+        # K1 on a settled residual, K2 on the window: no index source, no top-k
+        runner.precompile(m, k1={(False, False)}, k2={(False, False)})
+    return _Draft(model, runner, stages)
+
+
+SPEC = MonoSpec(
+    name="deepseek_v41_dspark_draft_hip",
+    devices={
+        "gfx950": DeviceLimits(
+            widths=tuple(range(1, target.MAX_ROWS + 1)),
+            tp_sizes=(2, 4),
+            resident_blocks=BLOCKS,
+        )
+    },
+    features=frozenset({Feature.SPECULATIVE_DECODING}),
+    requires=target.SPEC.requires,
+    numerics=target.NUMERICS,
+    config_disable_reasons=lambda cfg, hf_config: [],
+    model_disable_reasons=_model_disable_reasons,
+    build=_build,
+    api=1,  # sglang.srt.monokernels.spec.API_VERSION
+    load_tensor=_load_tensor,
+    tokens_per_request=_tokens_per_request,
+)
