@@ -16,6 +16,7 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 | --- | --- | --- | --- |
 | DeepSeek-V4.1-Flash | MI350X, MI355X (gfx950) | 2, 4 | All 40 layers in decode and DSpark verify steps of up to 48 rows, and the DSpark draft stages |
 | GLM-5.3-Flash | MI355X (gfx950) | 2, 4, 8 | 41 of the 42 MoE layers, all but the last (one launch each), in decode steps of up to 8 rows (4 at TP2) |
+| GLM-5.3 | MI355X (gfx950) | 4, 8 | All 75 MoE layers (one launch each), in decode steps of up to 8 rows (4 at TP4) |
 
 ### Design
 
@@ -69,7 +70,11 @@ sgl-amd-mono/
 │   │   ├── spec.py      # target model: spec and forward
 │   │   ├── draft.py     # DSpark draft model: spec and forward
 │   │   └── gfx950/      # kernels and launch runner
-│   └── glm53_flash/
+│   ├── glm53_flash/
+│   │   ├── spec.py      # spec and forward
+│   │   ├── check.py     # SGLANG_AMD_MONO_CHECK: each layer against SGLang's own
+│   │   └── gfx950/      # kernels and launch runner
+│   └── glm53/
 │       ├── spec.py      # spec and forward
 │       ├── check.py     # SGLANG_AMD_MONO_CHECK: each layer against SGLang's own
 │       └── gfx950/      # kernels and launch runner
@@ -83,8 +88,9 @@ sgl-amd-mono/
 
 ```bash
 pytest test/unit                                   # CPU only
-pytest test/kernels test/e2e -k "not glm53_flash"  # 4 x MI350X or MI355X, DEEPSEEK_V41_FLASH_MODEL_PATH set
+pytest test/kernels test/e2e -k "not glm53"        # 4 x MI350X or MI355X, DEEPSEEK_V41_FLASH_MODEL_PATH set
 pytest test/kernels test/e2e -k glm53_flash        # GLM_53_FLASH_MODEL_PATH set: kernels on 8 GPUs, server at TP4
+pytest test/e2e -k "glm53 and not glm53_flash"     # GLM_53_MODEL_PATH set: server at TP8
 ```
 
 ## Contributing
