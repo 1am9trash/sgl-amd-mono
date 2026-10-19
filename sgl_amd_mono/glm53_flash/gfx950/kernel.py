@@ -44,7 +44,7 @@ from flydsl.expr.typing import Int32, Int64, T
 
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.epoch import kernel_symbol, spin_until
-from sgl_amd_mono.common.plan import key_tuple
+from sgl_amd_mono.common.plan import kernel_sources, key_tuple
 
 from .config import (
     EPS,
@@ -137,7 +137,6 @@ from .ops import (
 )
 from .ops import xred as _xred
 from .ops import xshfl as _xshfl
-from .sources import SOURCES
 from .tiles import (
     BLOCKS,
     CM_DEV,
@@ -152,6 +151,8 @@ from .tiles import (
     WAVES,
     atom_mxfp4_scale_index,
 )
+
+SOURCES = kernel_sources(__name__)
 
 # 5-key descending sorting network (lane's router candidates)
 SORT5 = ((0, 1), (3, 4), (2, 4), (2, 3), (0, 3), (0, 2), (1, 4), (1, 3), (1, 2))

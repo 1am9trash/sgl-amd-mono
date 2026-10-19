@@ -32,6 +32,7 @@ from sgl_amd_mono.common.plan import (
     THREADS,
     WAVES,
     first_task,
+    kernel_sources,
     key_tuple,
 )
 from sgl_amd_mono.common.sync import Mailbox, preg, publish, sreg
@@ -39,10 +40,11 @@ from sgl_amd_mono.common.sync import Mailbox, preg, publish, sreg
 from .attention import back as mb_back
 from .attention import front as mb_front
 from .attention.plan import WINDOW, Dims, back_scratch, front_scratch
-from .sources import SOURCES
 from .stages import moe, seam
 from .stages.dims import Dims as StageDims
 from .stages.moe_shape import EXPERTS, SORT_NETS, TOPK, MoeBuild, route_shape
+
+SOURCES = kernel_sources(__name__)
 
 _STREAM = fx.Stream(None)
 MAX_TOKENS = 48

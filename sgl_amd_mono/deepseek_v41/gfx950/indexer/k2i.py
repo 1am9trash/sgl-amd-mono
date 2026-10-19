@@ -27,10 +27,11 @@ import flydsl.expr as fx
 from flydsl.expr.typing import Int32, Int64
 
 from sgl_amd_mono.common.epoch import kernel_symbol
-from sgl_amd_mono.common.plan import BLOCKS, THREADS
+from sgl_amd_mono.common.plan import BLOCKS, THREADS, kernel_sources
 
-from ..sources import SOURCES
 from .score_fp4 import ROWS_LDS_WORDS, run_scores4
+
+SOURCES = kernel_sources(__name__)
 
 _STREAM = fx.Stream(None)
 MAX_ROWS = 48  # a step's rows at most (8 DSpark requests of 6)
