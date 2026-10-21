@@ -865,7 +865,9 @@ class _Built:
             pending = post if defer else (None, hidden, None, None)
         residual = pending[1]
         pre_hc_head = residual.flatten(1)
-        hidden = m.norm(mhc_combine(pre_hc_head.float(), pre, m.hc_mult, residual.dtype))
+        hidden = m.norm(
+            mhc_combine(pre_hc_head.float(), pre, m.hc_mult, residual.dtype)
+        )
         if aux is not None:
             return (hidden, pre_hc_head), aux
         return hidden, pre_hc_head
