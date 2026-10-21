@@ -115,10 +115,8 @@ SGLANG_READS = {
         "rocm_router_gemv_split_k(x)",
         "rocm_router_gemv_split_k(w)",
     ),
-    "kernels/ops/attention/dsv4/unified_kv_kernels/env_gate.py": (
-        "is_unified_kv_triton",
-    ),
-    "kernels/ops/layernorm/mhc.py": ("hc_broadcast", "hc_combine"),
+    "srt/layers/attention/dsv4/unified_kv_gate.py": ("is_unified_kv_triton",),
+    "kernels/ops/layernorm/mhc.py": ("hc_broadcast", "mhc_combine"),
     "kernels/ops/layernorm/mhc_boundary_hip.py": ("tensors",),
     "srt/arg_groups/fields/*.py": (
         "kv_cache_dtype",
@@ -331,9 +329,7 @@ def _covered_layers(config) -> list[int]:
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
     """What ``SPEC.requires`` cannot state: a value SGLang's attention gate must not
     take, aiter's own flag, and FlyDSL."""
-    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-        is_unified_kv_triton,
-    )
+    from sglang.srt.layers.attention.dsv4.unified_kv_gate import is_unified_kv_triton
     from sglang.srt.utils import get_bool_env_var
 
     reasons = []
@@ -835,7 +831,7 @@ class _Built:
     def _backbone(self, plan, input_ids, positions, forward_batch, input_embeds):
         """``DeepseekV4Model.forward``: the embedding, each layer as K1 and K2,
         SGLang's Engram writes, then the head's combine and norm."""
-        from sglang.kernels.ops.layernorm.mhc import hc_broadcast, hc_combine
+        from sglang.kernels.ops.layernorm.mhc import hc_broadcast, mhc_combine
 
         m = self.model
         self._warm_normal_moe()
@@ -869,7 +865,7 @@ class _Built:
             pending = post if defer else (None, hidden, None, None)
         residual = pending[1]
         pre_hc_head = residual.flatten(1)
-        hidden = m.norm(hc_combine(pre_hc_head.float(), pre, m.hc_mult, residual.dtype))
+        hidden = m.norm(mhc_combine(pre_hc_head.float(), pre, m.hc_mult, residual.dtype))
         if aux is not None:
             return (hidden, pre_hc_head), aux
         return hidden, pre_hc_head
