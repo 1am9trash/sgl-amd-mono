@@ -38,7 +38,7 @@ _CKPT_SHARED = re.compile(
 # parameter, ``"x"``: a string literal); test/unit/test_contract.py pins them.
 SGLANG_READS = {
     "srt/monokernels/spec.py": ("DeviceLimits", "Feature", "MonoSpec", "Requirements"),
-    "kernels/ops/layernorm/mhc.py": ("hc_combine",),
+    "kernels/ops/layernorm/mhc.py": ("mhc_combine",),
     "srt/environ.py": ("envs", "SGLANG_DSPARK_EMBED_IN_GRAPH"),
     "srt/layers/logits_processor.py": (
         "LogitsProcessorOutput",
@@ -174,7 +174,7 @@ class _Draft:
         self, plan, input_ids, positions, forward_batch, input_embeds=None, *_, **__
     ):
         """``DeepseekV4ForCausalLMDSpark.forward`` for a routed draft step."""
-        from sglang.kernels.ops.layernorm.mhc import hc_combine
+        from sglang.kernels.ops.layernorm.mhc import mhc_combine
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
         lm = self.lm
@@ -191,7 +191,7 @@ class _Draft:
                 pre,
             )
             x, pre, _ = target._boundary_out(L.module, False, *out)
-        x = hc_combine(x.flatten(1).float(), pre, lm.hc_mult, x.dtype)
+        x = mhc_combine(x.flatten(1).float(), pre, lm.hc_mult, x.dtype)
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
 
 
