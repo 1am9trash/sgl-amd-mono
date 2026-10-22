@@ -22,6 +22,7 @@ from sgl_amd_mono.common.ops import (
     xshfl,
 )
 from sgl_amd_mono.common.plan import first_task
+from sgl_amd_mono.common.stamps import stamp
 from sgl_amd_mono.deepseek_v41.gfx950.stages.gemv import (
     ld_f32,
     lds_row,
@@ -403,7 +404,9 @@ def front_context(key, lds, args: dict, scratch, tag, layout=None) -> dict:
 
 
 @flyc.jit
-def run_front(c, key, bid, x8_given=False, before_wqkv=None, after_wqkv=None):
+def run_front(
+    c, key, bid, x8_given=False, before_wqkv=None, after_wqkv=None, before_wqb=None
+):
     """Run the front's stages on this CTA; the seam publishes X8 before them."""
     s = key.tokens
     # the wqkv GEMV takes all of K from X8, which the seam publishes
@@ -420,10 +423,22 @@ def run_front(c, key, bid, x8_given=False, before_wqkv=None, after_wqkv=None):
     assert waves * 64 * 4 <= wqb_per_cta * RED  # the chains' partials fit ``red``
 
     # loads complete in issue order: each CTA issues its latency-critical loads first
-    wqkv_unit = first_task(bid, 0)
-    has_wqkv = wqkv_unit < n_wqkv
-    task = fx.min(wqkv_unit, n_wqkv - 1)
     wqb_task = first_task(bid, WQB0)
+    if const_expr(len(tiles) == 1):
+        wqkv_unit = first_task(bid, 0)
+        has_wqkv = wqkv_unit < n_wqkv
+        task = fx.min(wqkv_unit, n_wqkv - 1)
+        kt_from, kt_step = n_wqkv, BLOCKS - n_wqkv
+    else:
+        # past one token tile, a row tile's tiles spread over the CTAs task, task +
+        # n_wqkv, ... (ROCm/ATOM's tile tasks): no CTA runs every tile in turn
+        task = bid % n_wqkv
+        group = bid // n_wqkv
+        ctas = (BLOCKS - 1 - task) // n_wqkv + 1
+        has_wqkv = group < fx.min(ctas, len(tiles))
+        # the key table on the CTAs without a tile, else past the first round
+        kt_from = n_wqkv * len(tiles) if n_wqkv * len(tiles) < BLOCKS else n_wqkv
+        kt_step = BLOCKS - kt_from
     if const_expr(before_wqkv is not None):
         before_wqkv()
     slots = chain_slots(c, HIDDEN // 128, waves)
@@ -431,13 +446,13 @@ def run_front(c, key, bid, x8_given=False, before_wqkv=None, after_wqkv=None):
     if const_expr(after_wqkv is not None):
         after_wqkv()
     if const_expr(key.kt):
-        # K2's key table on the CTAs without a wqkv row tile; K2 reads it a launch later
-        free = bid - n_wqkv
-        for t in range((free >= 0).select(free, fx.Int32(s)), s, BLOCKS - n_wqkv):
+        # K2's key table on CTAs past the wqkv units; K2 reads it a launch later
+        kt_first = bid - kt_from
+        for t in range((kt_first >= 0).select(kt_first, fx.Int32(s)), s, kt_step):
             stage_kt(c, t)
+    stamp(c, 35)
     poss = [wqb_pos(c, t0, n) for t0, n in tiles]
 
-    # wqkv_a: one row tile a CTA, all of K in LDS, the next token tile in flight
     def wqb_weights():
         return [
             gemv_loads(c, a["wqb"], a["wqb_s"], Q_RANK, (wqb_task + BLOCKS * i) * ROWS)
@@ -463,12 +478,7 @@ def run_front(c, key, bid, x8_given=False, before_wqkv=None, after_wqkv=None):
             for p in range(WQKV_KPARTS)
         ]
 
-    await_flags(c, c["xrdy"], WQKV_KPARTS * s, lambda u: u)
-    regs = x_loads(*tiles[0])
-    if const_expr(len(tiles) == 1):
-        bops = wqb_weights()
-    for ti in range_constexpr(len(tiles)):
-        t0, n = tiles[ti]
+    def x_store(regs, n):
         for p in range_constexpr(WQKV_KPARTS):
             rows_store(
                 c,
@@ -481,20 +491,52 @@ def run_front(c, key, bid, x8_given=False, before_wqkv=None, after_wqkv=None):
                 lds_row(X_WORDS),
                 lds_row(X_GROUPS),
             )
-        if const_expr(ti + 1 < len(tiles)):
-            regs = x_loads(*tiles[ti + 1])
-        if const_expr(ti + 2 == len(tiles)):
-            bops = wqb_weights()
+
+    if const_expr(len(tiles) == 1):
+        # wqkv_a: one row tile a CTA, all of K in LDS
+        t0, n = tiles[0]
+        await_flags(c, c["xrdy"], WQKV_KPARTS * s, lambda u: u)
+        regs = x_loads(t0, n)
+        bops = wqb_weights()
+        x_store(regs, n)
         accs = stage_wqkv(c, kops, slots, n, halves)
         wqkv_publish(c, task, accs, slots, order, t0, n, has_wqkv)
+    else:
+        # wqkv_a: this CTA's tiles of its row tile, each on its own tokens' flags
+        for ti in range_constexpr(len(tiles)):
+            t0, n = tiles[ti]
+            if has_wqkv & (fx.Int32(ti) % ctas == group):
+                await_flags(
+                    c, c["xrdy"], WQKV_KPARTS * n, lambda u: WQKV_KPARTS * t0 + u
+                )
+                x_store(x_loads(t0, n), n)
+                # nothing assigned in a traced branch: FlyDSL yields no None
+                wqkv_publish(
+                    c,
+                    task,
+                    stage_wqkv(c, kops, slots, n, halves),
+                    slots,
+                    order,
+                    t0,
+                    n,
+                    has_wqkv,
+                )
+        # the wq_b weights in flight through the wait on q
+        bops = wqb_weights()
 
+    stamp(c, 36)
     # ---- q / kv norms, KV insert
     for t in range(first_task(bid, QKV0), s, BLOCKS):
         stage_qkv(c, t)
+    stamp(c, 37)
 
     # wq_b: every task's rows for one token tile at a time
     ropes = [wqb_rope(c, wqb_task, poss[ti], tiles[ti][1]) for ti in range(len(tiles))]
+    if const_expr(before_wqb is not None):
+        # work that does not wait on q: it runs while the qkv stage finishes
+        before_wqb()
     await_flags(c, c["qrdy"], s, lambda u: u)
+    stamp(c, 38)
     qx = (c["qx8"], c["qx8s"], QX_WORDS, 0, QX_WORDS, Q_RANK // 32, 0, Q_RANK // 32)
     regs = rows_loads(c, *qx, *tiles[0])
     for ti in range_constexpr(len(tiles)):
@@ -503,3 +545,4 @@ def run_front(c, key, bid, x8_given=False, before_wqkv=None, after_wqkv=None):
         if const_expr(ti + 1 < len(tiles)):
             regs = rows_loads(c, *qx, *tiles[ti + 1])
         stage_wqb(c, wqb_task, bops, t0, n, ropes[ti])
+    stamp(c, 39)

@@ -178,20 +178,22 @@ class _Draft:
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
         lm = self.lm
-        x = lm.forward_embed(input_ids) if input_embeds is None else input_embeds
-        pre = None
-        for L in self.stages:  # each stage settles its post: what SGLang's returns
+        x = input_embeds
+        if x is None:  # ``forward_embed``, from the target's whole table
+            x = target.embed(lm.embed_tokens, input_ids).unsqueeze(1)
+            x = x.repeat(1, lm.hc_mult, 1)
+        # a stage's post folds into the next stage's K1 (as the target's layers do);
+        # the last stage settles its own
+        pending, pre = (None, x, None, None), None
+        for j, L in enumerate(self.stages):
             out = target._launch(
-                self.runner,
-                L,
-                plan,
-                positions,
-                forward_batch,
-                (None, x, None, None),
-                pre,
+                self.runner, L, plan, positions, forward_batch, pending, pre
             )
-            x, pre, _ = target._boundary_out(L.module, False, *out)
-        x = mhc_combine(x.flatten(1).float(), pre, lm.hc_mult, x.dtype)
+            defer = j + 1 < len(self.stages)
+            x, pre, post = target._boundary_out(L.module, defer, *out)
+            pending = post if defer else (None, x, None, None)
+        # mhc_combine widens x on load: no f32 copy first
+        x = mhc_combine(x.flatten(1), pre, lm.hc_mult, x.dtype)
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
 
 
@@ -222,8 +224,9 @@ def _build(model, hf_config, ctx) -> _Draft:
     widths = list(ctx.widths)
     start = len(widths) * p.tp_rank // p.tp_size
     for m in widths[start:] + widths[:start]:
-        # K1 on a settled residual, K2 on the window: no index source, no top-k
-        runner.precompile(m, k1={(False, False)}, k2={(False, False)})
+        # K1 on the first stage's settled residual, then folding the stage before's
+        # post; K2 on the window: no index source, no top-k
+        runner.precompile(m, k1={(False, False), (True, False)}, k2={(False, False)})
     return _Draft(model, runner, stages)
 
 

@@ -52,6 +52,7 @@ from sgl_amd_mono.common.plan import (
     first_task,
     pair_layout,
 )
+from sgl_amd_mono.common.stamps import stamp
 from sgl_amd_mono.common.sync import (
     preg,
     publish,
@@ -263,8 +264,20 @@ def put_mxfp8_group_vllm(c, words_mb, codes_mb, t, g, v, amax):
 
 
 # ---------------------------------------------------------------- router
+ROUTER_EARLY_FROM = 12  # rows from which the router loads its gate rows early
+
+
+def router_weights(c, task):
+    """The router task's gate rows, loaded (``stage_router`` takes them early)."""
+    per_group = c["rs"].experts // ROWS * ROUTER_PARTS
+    tile, part = task % per_group // ROUTER_PARTS, task % ROUTER_PARTS
+    return router_weight_loads(
+        c["args"]["gate_w"], tile, part, c["lane"], c["wave"], CM_NT
+    )
+
+
 @flyc.jit
-def stage_router(c, task):
+def stage_router(c, task, wvs=None):
     """Router task: K part ``part`` of gate rows 16 ``tile`` .. times the group's tokens -> f32 sum."""
     s, tid, red, lane, wave = c["S"], c["tid"], c["red"], c["lane"], c["wave"]
     a = c["args"]
@@ -283,7 +296,8 @@ def stage_router(c, task):
         )
         for j0 in range(0, per, TILE)
     ]
-    wvs = router_weight_loads(a["gate_w"], tile, part, lane, wave, CM_NT)
+    if const_expr(wvs is None):
+        wvs = router_weights(c, task)
     xs = [router_x_loads(a["x"], part, n, lane, wave, CM_DEV, t0) for t0, n in tiles]
     for (t0, n), xvs in zip(tiles, xs):
         router_tile_mfma(wvs, xvs, lane, wave, red)
@@ -323,6 +337,8 @@ def stage_route(c, t):
     a = c["args"]
     if wave == 0:
         ept = experts // 64
+        # the bias in flight before the logits' wait
+        bias = [ld_f32(a["bias"], lane + 64 * i) for i in range(ept)]
         # each logit's router part sums, added in part order (vLLM's gate: f32 out)
         assert ROUTER_PARTS == 4
         got = c["poll"](
@@ -345,7 +361,7 @@ def stage_route(c, t):
             sc = _score(logits[i])
             # aiter's NaN guards: a NaN score weighs 0 and never wins
             orig.append(fx.isnan(sc).select(fx.Float32(0.0), sc))
-            vals.append(fx.max(sc + ld_f32(a["bias"], e), fx.Float32(float("-inf"))))
+            vals.append(fx.max(sc + bias[i], fx.Float32(float("-inf"))))
             idxs.append(e)
         for p, q in c["rs"].sort_net:
             sw = vals[p] < vals[q]
@@ -1349,12 +1365,17 @@ def run_moe(c, key, bid, before_ug=None):
         await_x(c, [t])
         stage_xq(c, t)
         publish(c["put"], c["x8rdy"], t, 1, tid == 0)
+    stamp(c, 19)
     multi = len(token_tiles(s)) > 1
     for task in range(first_task(bid, c["rs"].router0), router_tasks, BLOCKS):
+        # wide, the gate rows go out before x's wait (narrower it is slower: ROCm/ATOM)
+        wvs = router_weights(c, task) if const_expr(s >= ROUTER_EARLY_FROM) else None
         await_x(c, list(range(s)))
-        stage_router(c, task)
+        stage_router(c, task, wvs)
+    stamp(c, 20)
     for t in range(first_task(bid, route0), s, BLOCKS):
         stage_route(c, t)
+    stamp(c, 21)
     c["xl"], c["xsl"] = c["x8l"], c["x8sl"]
     # one shared unit a CTA at most: straight-line code, so LLVM does not hoist its loads
     assert c["rs"].shared_units <= BLOCKS
@@ -1373,6 +1394,7 @@ def run_moe(c, key, bid, before_ug=None):
             n = fx.min(fx.Int32(TILE), s - t0)
             load_x8_rows(c, "x8", "x8s", c["x8l"], c["x8sl"], lambda j: t0 + j, n)
             stage_shared(c, unit % shared_tasks, gops, t0, n)
+    stamp(c, 22)
     if const_expr(before_ug is not None):
         before_ug()
     c["xl"], c["xsl"] = c["x8rl"], c["x8rsl"]
@@ -1394,6 +1416,7 @@ def run_moe(c, key, bid, before_ug=None):
                 load_route(c, c["tab"])
             loaded = fx.Int32(1)
             stage_ug(c, task)
+    stamp(c, 24)
     assert BLOCKS < DOWN_TASKS <= 2 * BLOCKS
     # load the route table unless an earlier stage of this CTA loaded it
     if const_expr(not multi and ug_tasks <= BLOCKS):
@@ -1405,8 +1428,10 @@ def run_moe(c, key, bid, before_ug=None):
         stage_down(c, [down_task, BLOCKS + rank])
     else:
         stage_down(c, [down_task])
+    stamp(c, 25)
     for task in range(first_task(bid, RED0), RED_TASKS, BLOCKS):
         stage_reduce(c, task)
+    stamp(c, 26)
 
 
 def await_x(c, tokens):

@@ -119,10 +119,34 @@ def query_ref(qkv, a, cos_sin, pos):
     return o
 
 
+K1_MARKS = {
+    32: "start", 33: "slices", 34: "norm", 35: "kt", 36: "wqkv", 37: "qkv",
+    38: "qrdy", 39: "wq_b", 40: "gate",
+}  # fmt: skip
+
+
+def k1_timeline(M, tl) -> str:
+    """Each K1 stage's µs across CTAs (median, max) and on the CTA that ends last."""
+    marks = list(K1_MARKS)
+    last = int(tl[:, marks[-1]].argmax())
+    span = (tl[:, marks[-1]].max() - tl[:, marks[0]].min()).item() / 100.0
+    lines = [f"M={M} K1 {span:.2f} us; stage us (median / max / CTA {last}, last):"]
+    for a, b in zip(marks, marks[1:]):
+        d = (tl[:, b] - tl[:, a]).double() / 100.0  # 100 MHz ticks
+        lines.append(
+            f"  {K1_MARKS[b]:6s} {d.median().item():7.2f} {d.max().item():7.2f}"
+            f" {d[last].item():7.2f}"
+        )
+    return "\n".join(lines)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--widths", default=WIDTHS)
     ap.add_argument("--trials", type=int, default=3)
+    ap.add_argument(
+        "--timeline", action="store_true", help="print each width's stage timeline"
+    )
     args = ap.parse_args()
     rank, tp = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(rank)
@@ -151,6 +175,8 @@ def main():
     w, _, _ = make_weights(tp, rank, dev, seed=0)
     m = mono_weights(w)
     del w
+    if args.timeline:  # the runner builds its launches with stage marks
+        os.environ["SGLANG_AMD_MONO_TIMELINE"] = "1"
     r = DSV41MonoRunner(tp, rank, cpu, dev)
     heads = r.q.shape[1]
     g = torch.Generator(device=dev).manual_seed(11)
@@ -197,8 +223,12 @@ def main():
     ]
     for M, (vname, fold, index, first) in runs:
         ok, route = check_wqkv_route(M)
-        k1 = build_mono_k1(MonoBuild(M, tp, fold=fold, index=index))
-        lay = scratch_layout(M, tp)
+        route = r.route_at(M)
+        tl = r.timeline_on
+        k1 = build_mono_k1(
+            MonoBuild(M, tp, fold=fold, index=index, timeline=tl, **route)
+        )
+        lay = scratch_layout(M, tp, tl, **route)
         sc = r.scratch(M)
         static = [t.clone() for t in inputs(M)]
         swa = torch.full((PAGES, stride), 255, dtype=torch.uint8, device=dev)
@@ -227,6 +257,12 @@ def main():
 
         launch()
         torch.cuda.synchronize()
+        if args.timeline and vname == "fold":
+            for _ in range(5):
+                launch()
+            torch.cuda.synchronize()
+            if rank == 0:
+                print(k1_timeline(M, r.timeline(M).cpu()), flush=True)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             launch()

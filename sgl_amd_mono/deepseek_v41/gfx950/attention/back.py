@@ -48,12 +48,13 @@ from sgl_amd_mono.common.plan import (
     WAVES,
     first_task,
 )
+from sgl_amd_mono.common.stamps import stamp
 from sgl_amd_mono.deepseek_v41.gfx950.stages.gemv import (
     ld_f32,
     lds_row,
 )
 
-from .device import Mailbox, fp8x8_bf16, ld_i32, mx_code, mx_mul, pow2, stamp
+from .device import Mailbox, fp8x8_bf16, ld_i32, mx_code, mx_mul, pow2
 from .gemv import (
     RED,
     bf16_gemv_loads,
@@ -208,14 +209,7 @@ def stage_split(c, unit):
     g = lane // 16
     r16 = lane % 16
     k0 = ch * ck
-    if const_expr("krdy" in c):
-        # an index source's table: this launch builds it after the indexer ran
-        await_flags(c, c["krdy"], 1, lambda u: t)
-    # the key count, this lane's key and q: independent loads, out together
-    # (the key table holds -1 past a token's keys)
-    kv_len = ld_i32(a["klen"], t, CM_DEV if const_expr("krdy" in c) else 0)
-    key = k0 + kt * 16 + r16
-    data, sc, okv = key_rec(c, t, key)
+    # q does not depend on the key table: in flight before an index source's wait
     qrow = d.heads * HEAD_DIM // 8
     qv = []
     for i in range_constexpr(cdiv(qrow, THREADS)):
@@ -230,6 +224,14 @@ def stage_split(c, unit):
                 )
             )
         )
+    if const_expr("krdy" in c):
+        # an index source's table: this launch builds it after the indexer ran
+        await_flags(c, c["krdy"], 1, lambda u: t)
+    # the key count and this lane's key: independent loads, out together
+    # (the key table holds -1 past a token's keys)
+    kv_len = ld_i32(a["klen"], t, CM_DEV if const_expr("krdy" in c) else 0)
+    key = k0 + kt * 16 + r16
+    data, sc, okv = key_rec(c, t, key)
     if k0 < kv_len:
         # a key's 448 e4m3 as 7 x 16 B (lane g: dims 64 c + 16 g ..), its 64
         # bf16 rope dims as 2 x 16 B (32 c + 8 g ..), its 7 scale bytes
@@ -443,11 +445,6 @@ def stage_combine(c, unit):
     h = hg * COMB_HEADS + wave
     nchunk = c["nchunk"]
     ck = chunk_keys(d, s)
-    if const_expr("krdy" in c):
-        # an index source's key count: written by this launch, past the CU's cache
-        await_flags(c, c["krdy"], 1, lambda u: t)
-    kv_len = ld_i32(a["klen"], t, CM_DEV if const_expr("krdy" in c) else 0)
-    nlive = (kv_len + ck - 1) // ck
     pos = ld_i32(a["pos"], 2 * t)
     sink = ld_f32(a["sink"], h) * fx.Float32(LOG2E)
     d0 = lane * 8  # this lane's 8 dims
@@ -463,6 +460,12 @@ def stage_combine(c, unit):
         )
         for i in range(4)
     ]
+    # the position, sink and RoPE above do not depend on the key table
+    if const_expr("krdy" in c):
+        # an index source's key count: written by this launch, past the CU's cache
+        await_flags(c, c["krdy"], 1, lambda u: t)
+    kv_len = ld_i32(a["klen"], t, CM_DEV if const_expr("krdy" in c) else 0)
+    nlive = (kv_len + ck - 1) // ck
     await_flags(c, c["srdy"], nlive, lambda u: t * nchunk + u)
     m = fx.Float32(NEG)
     ms, ls, vs = [], [], []

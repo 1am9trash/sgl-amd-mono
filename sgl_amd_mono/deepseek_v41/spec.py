@@ -427,12 +427,32 @@ def _indexer_reasons(*, i: int, attn) -> list[str]:
     return reasons
 
 
+FULL_EMBEDDING = "_mono_full_embedding"  # the embedding module's whole table
+
+
+def embed(module, input_ids: torch.Tensor) -> torch.Tensor:
+    """The tokens' embeddings: from the whole table kept at load, else the module."""
+    full = module.__dict__.get(FULL_EMBEDDING)
+    if full is None:
+        return module(input_ids)
+    return torch.nn.functional.embedding(input_ids, full)
+
+
 def _load_tensor(copies: dict, model, name: str, tensor: torch.Tensor) -> None:
-    """Keep this rank's shard of each covered layer's FP8 shared expert, by its
-    checkpoint name (``layers.{i}.ffn.shared_experts.{w1,w2,w3}.{weight,scale}``;
-    the checkpoint's ``mtp.*`` layers do not match)."""
+    """Keep the whole embedding table, and this rank's shard of each covered
+    layer's FP8 shared expert, by its checkpoint name
+    (``layers.{i}.ffn.shared_experts.{w1,w2,w3}.{weight,scale}``; the checkpoint's
+    ``mtp.*`` layers do not match)."""
     from sglang.srt.runtime_context import get_parallel
 
+    if name == "embed.weight":
+        # every rank's own copy of the vocabulary: a routed step (and the draft,
+        # which shares the module) looks a token up without the vocab-parallel
+        # embedding's all-reduce, which only adds zeros to the owning rank's row
+        model.model.embed_tokens.__dict__[FULL_EMBEDDING] = tensor.to(
+            torch.cuda.current_device(), copy=True
+        )
+        return
     m = _CKPT_SHARED.fullmatch(name)
     if m is None or int(m["i"]) not in _covered_layers(model.config):
         return
@@ -713,9 +733,14 @@ def _select(*, runner, L, plan, backend, positions, pos, forward_batch, M) -> No
     kind = "full" if not two_level else "reindex" if ix.uses_candidates else "producer"
     if L.plane is None:  # the layer's index plane, at its first launch (eager)
         L.plane = _index_plane(L=L, M=M, meta=meta, raw_idx=raw_idx)
-    bounds = meta.compressed_seq_lens
-    if bounds.dtype != torch.int32 or not bounds.is_contiguous():
-        bounds = bounds.to(torch.int32).contiguous()
+    # the step's bounds of this ratio, as int32: every index source of the ratio
+    # shares them
+    bounds = plan.state.get(("k2i bounds", r))
+    if bounds is None:
+        bounds = meta.compressed_seq_lens
+        if bounds.dtype != torch.int32 or not bounds.is_contiguous():
+            bounds = bounds.to(torch.int32).contiguous()
+        plan.state["k2i bounds", r] = bounds
     k2i, per_req = runner.k2i, plan.key.tokens_per_request
     if kind != "reindex" and ("k2i plan", r) not in plan.state:
         # the step's walk plan of this ratio: its FULL and producer layers share it
@@ -736,7 +761,12 @@ def _select(*, runner, L, plan, backend, positions, pos, forward_batch, M) -> No
         page_out=page_idx,
         # the candidate source's blocks of this step, for the layers after it
         candidates=plan.state["k2i candidates"] if kind == "reindex" else None,
+        # the step's REINDEX layers share their table (same blocks, page table and
+        # bounds): built at the first
+        reindex_table_built=kind == "reindex" and ("k2i reindex", r) in plan.state,
     )
+    if kind == "reindex":
+        plan.state["k2i reindex", r] = True
     if kind == "producer":
         plan.state["k2i candidates"] = published
 
@@ -839,7 +869,11 @@ class _Built:
 
         m = self.model
         self._warm_normal_moe()
-        x = m.embed_tokens(input_ids) if input_embeds is None else input_embeds
+        x = (
+            input_embeds
+            if input_embeds is not None
+            else embed(m.embed_tokens, input_ids)
+        )
         # the compressor caches each step's rotary tables on the batch
         for attr in ("freqs_cis_c4", "freqs_cis_c128"):
             if hasattr(forward_batch, attr):
@@ -849,6 +883,12 @@ class _Built:
             hash_ids = m.engram_hasher(input_ids, forward_batch)
         aux = None if m.dspark_layers_to_capture is None else []
         plan.state["dspark_aux"] = aux
+        # every image-token row keeps its residual through an Engram write, as in
+        # SGLang's forward: a captured graph cannot branch on whether the batch has
+        # mm inputs
+        image = None
+        if m.config.vision_n_layers > 0:
+            image = (input_ids == m.config.image_token_id)[:, None, None]
         pending, pre = (None, hc_broadcast(x, m.hc_mult), None, None), None
         for i in range(m.start_layer, m.end_layer):
             engram = m.layers[i].engram
@@ -857,11 +897,8 @@ class _Built:
                 residual = engram(
                     before, hash_ids[:, engram.layer_hash_index], forward_batch
                 )
-                # every image-token row keeps its residual, as in SGLang's forward: a
-                # captured graph cannot branch on whether the batch has mm inputs
-                if m.config.vision_n_layers > 0:
-                    image = input_ids == m.config.image_token_id
-                    residual = torch.where(image[:, None, None], before, residual)
+                if image is not None:
+                    residual = torch.where(image, before, residual)
                 pending = (None, residual, None, None)
             # an Engram layer reads the settled residual: no post owed into it
             defer = i + 1 < m.end_layer and m.layers[i + 1].engram is None
@@ -871,9 +908,8 @@ class _Built:
             pending = post if defer else (None, hidden, None, None)
         residual = pending[1]
         pre_hc_head = residual.flatten(1)
-        hidden = m.norm(
-            mhc_combine(pre_hc_head.float(), pre, m.hc_mult, residual.dtype)
-        )
+        # mhc_combine widens x on load: no f32 copy first
+        hidden = m.norm(mhc_combine(pre_hc_head, pre, m.hc_mult, residual.dtype))
         if aux is not None:
             return (hidden, pre_hc_head), aux
         return hidden, pre_hc_head

@@ -171,9 +171,31 @@ def mx_region(scratch, layout, name, rows, cols):
     )
 
 
+def k2_timeline(M, tl) -> str:
+    """Every mark K2 passed (the back's 0 .., the FFN's 16 ..), in median order:
+    its µs after the first CTA's start (median CTA, last CTA), and the CTA that
+    ends last's own steps."""
+    marks = [k for k in range(28) if bool((tl[:, k] != 0).all())]
+    t0 = tl[:, marks[0]].min()
+    rel = (tl[:, marks] - t0).double() / 100.0  # 100 MHz ticks
+    order = sorted(range(len(marks)), key=lambda i: rel[:, i].median().item())
+    last = int(tl[:, 27].argmax()) if 27 in marks else 0
+    lines = [f"M={M} K2 timeline (median CTA / last CTA / CTA {last}), us:"]
+    for i in order:
+        lines.append(
+            f"  mark {marks[i]:2d} {rel[:, i].median().item():8.2f}"
+            f" {rel[:, i].max().item():8.2f} {rel[last, i].item():8.2f}"
+        )
+    return "\n".join(lines)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--replays", type=int, default=200)
+    ap.add_argument(
+        "--timeline", action="store_true", help="print each width's stage timeline"
+    )
+    ap.add_argument("--widths", default="", help="comma-separated widths to run")
     args = ap.parse_args()
     rank, tp = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(rank)
@@ -195,6 +217,8 @@ def main():
     w, _, _ = make_weights(tp, rank, dev)
     mw = mono_weights(w)
     mw.check(tp)
+    if args.timeline:  # the runner builds its launches with stage marks
+        os.environ["SGLANG_AMD_MONO_TIMELINE"] = "1"
     runner = DSV41MonoRunner(tp, rank, cpu, dev)
 
     # the KV caches are alike on every rank; the heads, wo_a and wo_b are this rank's
@@ -227,7 +251,8 @@ def main():
     aw.check(d)
 
     fails, steps = [], []
-    for M in WIDTHS:
+    widths = tuple(int(w) for w in args.widths.split(",")) if args.widths else WIDTHS
+    for M in widths:
         gk = torch.Generator().manual_seed(
             1000 + M
         )  # alike on every rank: the step's metadata
@@ -247,7 +272,13 @@ def main():
             aw, mw, M, pos, swa_raw, SWA_BLOCK, comp_raw, COMP_BLOCK
         )
         torch.cuda.synchronize()
-        lay, sc = scratch_layout(M, tp), runner.scratch(M)
+        if args.timeline:
+            for _ in range(5):
+                runner.k2(aw, mw, M, pos, swa_raw, SWA_BLOCK, comp_raw, COMP_BLOCK)
+            torch.cuda.synchronize()
+            if rank == 0:
+                print(k2_timeline(M, runner.timeline(M).cpu()), flush=True)
+        lay, sc = scratch_layout(M, tp, **runner.route_at(M)), runner.scratch(M)
         live = torch.tensor([t not in pad for t in range(M)], device=dev)
         # XO: the attention, combine and inverse RoPE
         o = lay["xo"][0]

@@ -24,6 +24,7 @@ from .layer import (
     build_mono_k2,
     peer_half_bytes,
     scratch_bytes,
+    scratch_layout,
 )
 from .stages.dims import Dims as MoeDims
 from .stages.moe_shape import EXPERTS
@@ -39,6 +40,8 @@ __all__ = [
 ]
 
 HC = 4
+# below this many rows an ug task takes one FP4 group (``route_at``)
+FINE_UG_ROWS = 7
 RECORD = DATA + 8  # a token's KV record: 576 B of data, then 8 B of scales
 _LOG2E = 1.4426950408889634
 DEFAULT_DEADLINE_S = (
@@ -261,16 +264,17 @@ class DSV41MonoRunner:
         device: torch.device | str = "cuda",
         experts: int = EXPERTS,
         topk: int = ROUTE_TOPK,
-        ug_groups: int = 2,
+        ug_groups: int | None = None,
         swa_width: int = WINDOW,
     ):
         _ensure_writable_flydsl_cache()
         from sgl_amd_mono.common.peer import PeerBuffer
 
         self.tp, self.rank = tp, rank
-        self.route = dict(
-            experts=experts, topk=topk, ug_groups=ug_groups, swa_width=swa_width
-        )
+        self.route = dict(experts=experts, topk=topk, swa_width=swa_width)
+        self.ug_groups = ug_groups
+        # each launch marks its stages in its width's scratch (``timeline``)
+        self.timeline_on = os.environ.get("SGLANG_AMD_MONO_TIMELINE") == "1"
         self.d = Dims(tp)
         dev = torch.device(device)
         if dev.index is None:
@@ -342,12 +346,34 @@ class DSV41MonoRunner:
         if buf is None:
             no_capture(f"step width {tokens}")
             buf = torch.zeros(
-                scratch_bytes(tokens, self.tp, **self.route),
+                scratch_bytes(
+                    tokens, self.tp, self.timeline_on, **self.route_at(tokens)
+                ),
                 dtype=torch.uint8,
                 device=self.device,
             )
             self._scratch[tokens] = buf
         return buf
+
+    def route_at(self, tokens: int) -> dict:
+        """The route every launch and the scratch of this width share: below
+        ``FINE_UG_ROWS`` rows an ug task takes one FP4 group, so twice the tasks end
+        closer together (ROCm/ATOM's fine ug); the draft fixes its own."""
+        ug = self.ug_groups or (1 if tokens < FINE_UG_ROWS else 2)
+        return {**self.route, "ug_groups": ug}
+
+    def timeline(self, tokens: int) -> torch.Tensor:
+        """The last launch's stage marks at this width: int64 [BLOCKS, TL_POINTS],
+        100 MHz ticks (SGLANG_AMD_MONO_TIMELINE=1 builds only)."""
+        from sgl_amd_mono.common.stamps import TL_POINTS
+
+        lay = scratch_layout(tokens, self.tp, True, **self.route_at(tokens))
+        off, n = lay["timeline"]
+        return (
+            self.scratch(tokens)[off : off + n]
+            .view(torch.int64)
+            .view(BLOCKS, TL_POINTS)
+        )
 
     @staticmethod
     def supports(tokens: int) -> bool:
@@ -368,7 +394,8 @@ class DSV41MonoRunner:
                     index=index,
                     fault_site=self.fault_site,
                     fault_after=self.fault_after,
-                    **self.route,
+                    timeline=self.timeline_on,
+                    **self.route_at(tokens),
                 )
             )
         return self._kernels[key]
@@ -399,7 +426,8 @@ class DSV41MonoRunner:
                     self.tp,
                     fault_site=self.fault_site,
                     fault_after=self.fault_after,
-                    **self.route,
+                    timeline=self.timeline_on,
+                    **self.route_at(tokens),
                 )
             )
         return self._kernels[key]
@@ -417,7 +445,8 @@ class DSV41MonoRunner:
                     compressed=compressed,
                     fault_site=self.fault_site,
                     fault_after=self.fault_after,
-                    **self.route,
+                    timeline=self.timeline_on,
+                    **self.route_at(tokens),
                 )
             )
         return self._kernels[key]
