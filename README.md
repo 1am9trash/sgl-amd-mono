@@ -4,9 +4,9 @@
 
 **SGLang-AMD-Mono** is the monokernel library of the [SGLang](https://github.com/sgl-project/sglang) framework for AMD Instinct GPUs. A monokernel is a persistent kernel that runs most of a decoder layer, including its attention, its mixture-of-experts block and both tensor-parallel all-reduces, in one or two launches. This removes the launch gaps and collective latency that dominate small-batch decoding.
 
-The library implements SGLang's monokernel interface ([RFC #43949](https://github.com/sgl-project/sglang/issues/43949)) and loads as an SGLang [general plugin](https://github.com/sgl-project/sglang/blob/main/docs/docs/hardware-platforms/plugin.mdx) (the `sglang.srt.plugins` entry point), which registers each model's spec under the monokernel backend `amd`. With `--monokernel-backend amd`, every decode and speculative-verify step that a spec serves runs on its kernels, and every other step runs SGLang's standard path.
+The library implements SGLang's monokernel interface ([RFC #43949](https://github.com/sgl-project/sglang/issues/43949)) and loads as an SGLang [general plugin](https://github.com/sgl-project/sglang/blob/main/docs/docs/hardware-platforms/plugin.mdx) (the `sglang.srt.plugins` entry point), which registers each model's spec under the monokernel backend `amd`. With `--enable-amd-monokernel` (`--monokernel-backend amd` before [sgl-project/sglang#45389](https://github.com/sgl-project/sglang/pull/45389)), every decode and speculative-verify step that a spec serves runs on its kernels, and every other step runs SGLang's standard path.
 
-> **Experimental:** `--monokernel-backend` is an experimental SGLang feature. The kernels, the models and setups they cover, and the plugin interface may change.
+> **Experimental:** `--enable-amd-monokernel` is an experimental SGLang feature. The kernels, the models and setups they cover, and the plugin interface may change.
 
 ## Features
 
@@ -30,10 +30,10 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 
 ### Requirements
 
-- SGLang with the monokernel interface (`sglang.srt.monokernels`, in review as [sgl-project/sglang#44353](https://github.com/sgl-project/sglang/pull/44353))
+- SGLang with the monokernel interface (`sglang.kernels.plugin_kernels.amd` and `sglang.srt.kernel_plugins.amd`; `sglang.srt.monokernels` before [sgl-project/sglang#45389](https://github.com/sgl-project/sglang/pull/45389))
 - ROCm with FlyDSL and AITER, as included in SGLang's ROCm images
 - AMD Instinct MI350X or MI355X
-- MiniMax-M3 also needs SGLang's page16 SHUFFLE K / V for AITER sparse attention ([sgl-project/sglang#41998](https://github.com/sgl-project/sglang/pull/41998), on [#41708](https://github.com/sgl-project/sglang/pull/41708)). Until both merge, `--monokernel-backend amd` refuses MiniMax-M3 and names them.
+- MiniMax-M3 also needs SGLang's page16 SHUFFLE K / V for AITER sparse attention ([sgl-project/sglang#41998](https://github.com/sgl-project/sglang/pull/41998), on [#41708](https://github.com/sgl-project/sglang/pull/41708)). Until both merge, `--enable-amd-monokernel` refuses MiniMax-M3 and names them.
 
 ### Installation
 
