@@ -157,6 +157,8 @@ def main():
     ap.add_argument(
         "--timeline", action="store_true", help="print each width's stage timeline"
     )
+    # K1 reads wqkv and wq_b in aiter's (16, 16) preshuffle; the references keep row-major
+    ap.add_argument("--shuffled", action="store_true")
     args = ap.parse_args()
     rank, tp = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(rank)
@@ -201,6 +203,12 @@ def main():
     m.ffn_norm.copy_(
         (torch.randn(HIDDEN, generator=g, device=dev) * 1.5).exp().to(m.ffn_norm.dtype)
     )
+    if args.shuffled:
+        from aiter.ops.shuffle import shuffle_weight
+
+        kw = {n: shuffle_weight(a[n], (16, 16)) for n in ("wqkv", "wqb")}
+    else:
+        kw = {n: a[n] for n in ("wqkv", "wqb")}
     cos_sin = rope_table(dev)
     # an indexer (replicated on every rank): wq_b [4096, 1280] e4m3 with E8M0
     # 32 x 32 blocks, weights_proj [32, 5120] bf16, the head-weight scale 2^-6
@@ -216,6 +224,7 @@ def main():
         dtype=torch.uint8,
     )
     iw_w = (torch.randn(32, HIDDEN, generator=gi, device=dev) * 0.02).bfloat16()
+    kw["iq_w"] = shuffle_weight(iq_w, (16, 16)) if args.shuffled else iq_w
     iw_scale = 128**-0.5 * 32**-0.5
     iw_bits = struct.unpack("<i", struct.pack("<f", iw_scale))[0]
     freqs = torch.complex(cos_sin[:, :32], cos_sin[:, 32:])  # SGLang's freqs_cis
@@ -269,6 +278,7 @@ def main():
         k1 = build_mono_k1(
             MonoBuild(
                 M, tp, fold=fold, index=index, timeline=tl, tok_par=tok_par, iq=iq,
+                shuffled=args.shuffled,
                 **route,
             )
         )  # fmt: skip
@@ -297,10 +307,10 @@ def main():
                 m.hc_ffn_fn.data_ptr(), m.hc_ffn_scale.data_ptr(), m.hc_ffn_base.data_ptr(),
                 m.ffn_norm.data_ptr(),
                 r.res_mid.data_ptr(), aux.data_ptr(), r.post_a.data_ptr(), r.comb_a.data_ptr(),
-                r.pre_a.data_ptr(), a["wqkv"].data_ptr(), a["wqkv_s"].data_ptr(), a["q_norm"].data_ptr(), a["kv_norm"].data_ptr(),
-                a["wqb"].data_ptr(), a["wqb_s"].data_ptr(), cos_sin.data_ptr(), pos.data_ptr(),
+                r.pre_a.data_ptr(), kw["wqkv"].data_ptr(), a["wqkv_s"].data_ptr(), a["q_norm"].data_ptr(), a["kv_norm"].data_ptr(),
+                kw["wqb"].data_ptr(), a["wqb_s"].data_ptr(), cos_sin.data_ptr(), pos.data_ptr(),
                 slot.data_ptr(), 1, swa.data_ptr(), swa.stride(0), BLOCK, 0, 0, 0, 0, 0, 0, r.q.data_ptr(),
-                r.normed.data_ptr(), r.qr.data_ptr(), iq_w.data_ptr(), iq_ws.data_ptr(),
+                r.normed.data_ptr(), r.qr.data_ptr(), kw["iq_w"].data_ptr(), iq_ws.data_ptr(),
                 iw_w.data_ptr(), iw_bits, cos_sin.shape[0], r.iq.data_ptr(),
                 r.iqs.data_ptr(), r.iw.data_ptr(), sc.data_ptr(),
                 r.peer.local, r.peer.addresses.data_ptr(), r.rank, r.epoch.data_ptr(),

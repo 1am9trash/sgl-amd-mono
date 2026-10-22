@@ -100,6 +100,7 @@ class BackBuild(msgspec.Struct, frozen=True):
     tp: int
     ratio: int  # 0: window only; 1 / 2: top-k over a compressed cache
     timeline: bool = False
+    shuffled: bool = False  # wo_b in aiter's (16, 16) preshuffle (wo_a stays row-major)
 
 
 def plus(t0, v):
@@ -569,7 +570,15 @@ def stage_woa(c, task, acc, t0, n):
 
 def wob_loads(c, task, pred=None):
     a = c["args"]
-    return gemv_loads(c, a["wob"], a["wob_s"], c["d"].o_rows, task * ROWS, pred=pred)
+    return gemv_loads(
+        c,
+        a["wob"],
+        a["wob_s"],
+        c["d"].o_rows,
+        task * ROWS,
+        pred=pred,
+        shuffled=c["shuffled"],
+    )
 
 
 def _wob_store(a, t, col, v0, v1):
@@ -697,6 +706,7 @@ def back_context(key, lds, args: dict, scratch, tag, layout: dict) -> dict:
         "xsl": gml.xsl.ptr,
         "d": d,
         "ratio": key.ratio,
+        "shuffled": key.shuffled,
         "mb": Mailbox(tag),
         "nchunk": back_plan(key)[0],
         "sl": {"q": spl.q.ptr, "raw": spl.raw.ptr, "p": spl.p.ptr, "st": spl.st.ptr},

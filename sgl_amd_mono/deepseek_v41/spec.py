@@ -212,7 +212,10 @@ SGLANG_READS = {
         "w13_weight_scale_inv",
         '"w2_weight_scale_inv"',
     ),
-    "srt/layers/quantization/fp8_hip.py": ("mxfp8_native_ready",),
+    "srt/layers/quantization/fp8_hip.py": (
+        "mxfp8_native_ready",
+        "mxfp8_aiter_preshuffled",
+    ),
     "srt/layers/quantization/mxfp4.py": ("is_shuffled",),
     "srt/layers/layer_boundary/adapters/attention.py": (
         "get_attn_tp_context",
@@ -429,21 +432,64 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
                 f"{a.compress_ratio}; SGLang's low-ratio sources serve ratio 1 or 2"
             )
         reasons += _indexer_reasons(i=i, attn=a)
-        if any(
-            getattr(lin, "aiter_bpreshuffled", False)
-            or getattr(lin, "mxfp8_native_ready", False)
-            for lin in (a.wqkv_a, a.wq_b, a.wo_a, a.wo_b)
-        ):
-            reasons.append(
-                f"layer {i}: an FP8 linear method reordered an attention weight in "
-                "place; K1 and K2 read them row-major"
-            )
+        reasons += attn_layout_reasons(f"layer {i}", a)
+    if shuffled_layout(model.model.layers[i].self_attn for i in covered) is None:
+        reasons.append(
+            "wqkv_a / wq_b / wo_b are aiter-preshuffled on some layers and row-major "
+            "on others"
+        )
     if unseen:
         reasons.append(
             "the shared expert's FP8 checkpoint tensors were not seen at load "
             f"(layers {unseen})"
         )
     return reasons
+
+
+def _qkv_linears(attn) -> list:
+    return [attn.wqkv_a] if attn.fuse_wqa_wkv else [attn.wq_a, attn.wkv]
+
+
+def attn_layout_reasons(where: str, attn) -> list[str]:
+    """K1 and K2 read wo_a row-major, and wqkv / wq_b / wo_b row-major or in the
+    (16, 16) preshuffle of SGLang's MXFP8 aiter route; any other in-place reorder
+    of an attention weight is unsupported."""
+    linears = _qkv_linears(attn) + [attn.wq_b, attn.wo_a, attn.wo_b]
+    if any(
+        getattr(lin, "aiter_bpreshuffled", False)
+        or getattr(lin, "mxfp8_native_ready", False)
+        for lin in linears
+    ) or getattr(attn.wo_a, "mxfp8_aiter_preshuffled", False):
+        return [
+            f"{where}: an FP8 linear method reordered an attention weight in place "
+            "into a layout K1 / K2 do not read"
+        ]
+    return []
+
+
+def _iq_readable(attn) -> bool:
+    """Whether K1 reads the indexer's wq_b for the index query: MXFP8 e4m3 in the
+    layout of the layer's own wq_b (row-major or aiter's (16, 16) preshuffle);
+    else SGLang's chain computes it (``_index_query``), which reads any layout."""
+    w = attn.indexer.wq_b
+    return (
+        w.weight.dtype == torch.float8_e4m3fn
+        and not getattr(w, "aiter_bpreshuffled", False)
+        and not getattr(w, "mxfp8_native_ready", False)
+        and getattr(w, "mxfp8_aiter_preshuffled", False)
+        == getattr(attn.wq_b, "mxfp8_aiter_preshuffled", False)
+    )
+
+
+def shuffled_layout(attns) -> bool | None:
+    """Whether wqkv / wq_b / wo_b of these attentions are in aiter's (16, 16)
+    preshuffle; None when they mix layouts."""
+    seen = {
+        bool(getattr(lin, "mxfp8_aiter_preshuffled", False))
+        for a in attns
+        for lin in _qkv_linears(a) + [a.wq_b, a.wo_b]
+    }
+    return seen.pop() if len(seen) == 1 else (False if not seen else None)
 
 
 def _indexer_reasons(*, i: int, attn) -> list[str]:
@@ -623,7 +669,7 @@ def _weights(copies: dict, tables: list, layer, i: int) -> _Layer:
         cos_sin=cos_sin,
     )
     ix = getattr(a, "indexer", None)
-    if ix is not None and ix.wq_b.weight.dtype == e4m3:
+    if ix is not None and _iq_readable(a):
         # K1 computes the index query (``attention/index_query``) where it can
         L.k1.iq_w = ix.wq_b.weight
         L.k1.iq_ws = _codes(copies, i, "index wq_b", ix.wq_b)
@@ -1141,7 +1187,13 @@ def _build(model, hf_config, ctx) -> _Built:
     # the peer handshake is collective: every rank gets here (attach agreed first)
     p = get_parallel()
     device = model.model.layers[0].input_layernorm.weight.device
-    runner = DSV41MonoRunner(p.tp_size, p.tp_rank, p.tp_group.cpu_group, device)
+    runner = DSV41MonoRunner(
+        p.tp_size,
+        p.tp_rank,
+        p.tp_group.cpu_group,
+        device,
+        shuffled=bool(shuffled_layout(L.module.self_attn for L in layers.values())),
+    )
     runner.set_deadline(ctx.deadline_s)
     k2i = any(L.module.self_attn.indexer is not None for L in layers.values())
     if k2i:

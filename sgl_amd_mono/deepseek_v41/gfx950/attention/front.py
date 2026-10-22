@@ -96,6 +96,7 @@ class FrontBuild(msgspec.Struct, frozen=True):
     # a row's window index slots: the window, or for the DSpark draft the window
     # plus the block's keys
     swa_width: int = WINDOW
+    shuffled: bool = False  # wqkv and wq_b in aiter's (16, 16) preshuffle
 
 
 @flyc.jit
@@ -490,6 +491,7 @@ def front_context(key, lds, args: dict, scratch, tag, layout=None) -> dict:
         "mb": Mailbox(tag),
         "d": d,
         "swa_width": key.swa_width,
+        "shuffled": key.shuffled,
         "ldbf": lambda ptr, i: fx.Float32(
             fx.BFloat16(bo.buffer_load(rsrc(ptr), i, vec_width=1, dtype=T.bf16))
         ),
@@ -542,7 +544,9 @@ def run_front(
     if const_expr(before_wqkv is not None):
         before_wqkv()
     slots = chain_slots(c, HIDDEN // 128, waves)
-    kops = chain_loads(c, a["wqkv"], a["wqkv_s"], HIDDEN, task * ROWS, slots, has_wqkv)
+    kops = chain_loads(
+        c, a["wqkv"], a["wqkv_s"], HIDDEN, task * ROWS, slots, has_wqkv, c["shuffled"]
+    )
     if const_expr(after_wqkv is not None):
         after_wqkv()
     if const_expr(key.kt):
@@ -555,7 +559,14 @@ def run_front(
 
     def wqb_weights():
         return [
-            gemv_loads(c, a["wqb"], a["wqb_s"], Q_RANK, (wqb_task + BLOCKS * i) * ROWS)
+            gemv_loads(
+                c,
+                a["wqb"],
+                a["wqb_s"],
+                Q_RANK,
+                (wqb_task + BLOCKS * i) * ROWS,
+                shuffled=c["shuffled"],
+            )
             for i in range(wqb_per_cta)
         ]
 

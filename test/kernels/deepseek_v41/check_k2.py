@@ -196,6 +196,8 @@ def main():
         "--timeline", action="store_true", help="print each width's stage timeline"
     )
     ap.add_argument("--widths", default="", help="comma-separated widths to run")
+    # K2 reads wo_b in aiter's (16, 16) preshuffle; the references keep row-major
+    ap.add_argument("--shuffled", action="store_true")
     args = ap.parse_args()
     rank, tp = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(rank)
@@ -220,7 +222,7 @@ def main():
     mw.check(tp)
     if args.timeline:  # the runner builds its launches with stage marks
         os.environ["SGLANG_AMD_MONO_TIMELINE"] = "1"
-    runner = DSV41MonoRunner(tp, rank, cpu, dev)
+    runner = DSV41MonoRunner(tp, rank, cpu, dev, shuffled=args.shuffled)
 
     # the KV caches are alike on every rank; the heads, wo_a and wo_b are this rank's
     gc = torch.Generator(device=dev).manual_seed(5)
@@ -246,8 +248,13 @@ def main():
     )
     cos_sin = torch.cat([freqs.cos(), freqs.sin()], -1).contiguous()
     sink = torch.randn(d.heads, generator=gr, device=dev)
+    wob_k = wob[0]
+    if args.shuffled:
+        from aiter.ops.shuffle import shuffle_weight
+
+        wob_k = shuffle_weight(wob[0], (16, 16))
     aw = K2Weights(
-        woa=woa[0], woa_s=woa[1], wob=wob[0], wob_s=wob[1], sink=sink, cos_sin=cos_sin
+        woa=woa[0], woa_s=woa[1], wob=wob_k, wob_s=wob[1], sink=sink, cos_sin=cos_sin
     )
     aw.check(d)
 

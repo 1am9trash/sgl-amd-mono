@@ -51,8 +51,14 @@ class TestMonoDeepseekV41Kernels(CustomTestCase):
     def test_k1(self):
         self._check("check_k1", "--trials", "2")
 
+    def test_k1_preshuffled(self):
+        self._check("check_k1", "--trials", "2", "--shuffled")
+
     def test_k2(self):
         self._check("check_k2", "--replays", "100")
+
+    def test_k2_preshuffled(self):
+        self._check("check_k2", "--replays", "100", "--shuffled")
 
 
 if __name__ == "__main__":

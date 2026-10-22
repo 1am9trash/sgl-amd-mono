@@ -137,22 +137,18 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
             moe.experts.w13_weight, "is_shuffled", False
         ):
             reasons.append(f"stage {i}: needs {EXPERTS} experts in aiter's shuffle")
-        linears = [a.wqkv_a] if a.fuse_wqa_wkv else [a.wq_a, a.wkv]
-        if any(
-            getattr(lin, "aiter_bpreshuffled", False)
-            or getattr(lin, "mxfp8_native_ready", False)
-            for lin in linears + [a.wq_b, a.wo_a, a.wo_b]
-        ):
-            reasons.append(
-                f"stage {i}: an FP8 linear method reordered an attention weight in "
-                "place; K1 and K2 read them row-major"
-            )
+        reasons += target.attn_layout_reasons(f"stage {i}", a)
         if any(
             ("shared expert fp8", i, p, k) not in copies
             for p in target._SHARED
             for k in ("weight", "scale")
         ):
             unseen.append(i)
+    if target.shuffled_layout(s.self_attn for s in model.stages) is None:
+        reasons.append(
+            "wqkv / wq_b / wo_b are aiter-preshuffled on some stages and row-major "
+            "on others"
+        )
     if unseen:
         reasons.append(
             "the shared expert's FP8 checkpoint tensors were not seen at load "
@@ -238,6 +234,7 @@ def _build(model, hf_config, ctx) -> _Draft:
         topk=TOPK,
         ug_groups=UG_GROUPS,
         swa_width=SWA_WIDTH,
+        shuffled=bool(target.shuffled_layout(s.self_attn for s in model.stages)),
     )
     runner.set_deadline(ctx.deadline_s)
     widths = list(ctx.widths)
