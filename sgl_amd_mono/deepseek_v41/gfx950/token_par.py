@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from ROCm/ATOM (https://github.com/ROCm/ATOM) at 5e8d913, MIT License,
 # Copyright (C) 2026, Advanced Micro Devices, Inc.:
 # atom/models/deepseek_v41/mono/kernels/token_par.py and peer_layout.py
@@ -49,7 +48,7 @@ def peer_layout(s: int, tp: int) -> dict[str, tuple[int, int]]:
     ATTN and FFN, the sublayers' partials ``[source rank][row][hidden / 2]``; then
     the token-parallel gathers, ``[row][..]`` each: XG the MoE input rows, QG / QGS
     the q latent's MXFP8 words / codes, KG the window records, NBG and QRG an index
-    source's normed rows and qr (bf16 pairs)."""
+    source's normed rows and qr, and IWG its index head weights (bf16 pairs)."""
     row = s * HIDDEN // 2
     return pair_layout(
         [
@@ -61,6 +60,7 @@ def peer_layout(s: int, tp: int) -> dict[str, tuple[int, int]]:
             ("kg", s * KG_WORDS),
             ("nbg", row),
             ("qrg", s * Q_RANK // 2),
+            ("iwg", s * 16),
         ]
     )
 
