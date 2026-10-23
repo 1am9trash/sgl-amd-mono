@@ -3,7 +3,6 @@
 The layers its forward covers on DeepSeek-V4.1-Flash, its registry entry, its per-output bounds
 and its model refusal reasons; SGLang checks its declared requirements, as for every spec."""
 
-import inspect
 from types import SimpleNamespace
 
 import torch
@@ -45,15 +44,15 @@ def test_other_layers_have_no_kernels():
 def test_the_plugin_registers_both_specs():
     # what SGLang's load_plugins() runs, from the sglang.srt.plugins entry point
     sgl_amd_mono.register_specs()
-    # an SGLang with typed specs finds V4.1's by its model type
-    typed = "model_type" in inspect.signature(registry.find_spec).parameters
-    kw = {"model_type": "deepseek_v41"} if typed else {}
     for arch, spec in (
         ("DeepseekV4ForCausalLM", dsv41.SPEC),
         ("DeepseekV4ForCausalLMDSpark", draft.SPEC),
     ):
         found, why = registry.find_spec(
-            backend=sgl_amd_mono.BACKEND, architectures=[arch], isa="gfx950", **kw
+            backend=sgl_amd_mono.BACKEND,
+            architectures=[arch],
+            isa="gfx950",
+            model_type="deepseek_v41",
         )
         assert found is spec, why
 

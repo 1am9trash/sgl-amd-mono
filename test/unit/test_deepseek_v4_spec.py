@@ -2,10 +2,8 @@
 next to V4.1's, the configurations it refuses, and the unified KV rows its launches
 address. SGLang checks its declared requirements, the same way for every spec."""
 
-import inspect
 from types import SimpleNamespace
 
-import pytest
 import torch
 
 try:
@@ -18,8 +16,6 @@ from sgl_amd_mono.deepseek_v4 import spec as dsv4
 from sgl_amd_mono.deepseek_v4.gfx950.config import V4_PRO_CONFIG, compress_ratios
 from sgl_amd_mono.deepseek_v4.gfx950.runner import step_rows
 from sgl_amd_mono.deepseek_v41 import spec as dsv41
-
-TYPED = "model_type" in inspect.signature(registry.find_spec).parameters
 
 # DeepSeek-V4-Pro-0813's config.json, as SGLang holds it
 PRO = SimpleNamespace(
@@ -42,7 +38,6 @@ def server(**kw):
     )
 
 
-@pytest.mark.skipif(not TYPED, reason="SGLang without typed monokernel specs")
 def test_each_deepseek_v4_model_finds_its_own_spec():
     sgl_amd_mono.register_specs()
     find = registry.find_spec
