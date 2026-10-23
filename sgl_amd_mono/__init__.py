@@ -13,22 +13,23 @@ __version__ = "0.1.0.dev0"
 
 # the backend name every spec registers under
 BACKEND = "amd"
-# each spec by HF architecture; its module imports only when a server runs this backend
+# each spec by (HF architecture, model type), None for any model type; its module
+# imports only when a server runs this backend. DeepSeek-V4-Pro and V4.1 share an
+# architecture in SGLang, so their specs name their model types
 SPECS = {
-    "Glm5NextForConditionalGeneration": "sgl_amd_mono.glm53_flash.spec:SPEC",
-    "GlmMoeDsaForCausalLM": "sgl_amd_mono.glm53.spec:SPEC",
-    "MiniMaxM3SparseForCausalLM": "sgl_amd_mono.minimax.spec:SPEC",
-    "MiniMaxM3SparseForConditionalGeneration": "sgl_amd_mono.minimax.spec:SPEC",
-}
-# Specs of models that share an architecture, by (architecture, model type): SGLang
-# serves DeepSeek-V4 and V4.1 (and their DSpark drafts) as DeepseekV4ForCausalLM
-TYPED_SPECS = {
+    ("DeepseekV4ForCausalLM", "deepseek_v4"): "sgl_amd_mono.deepseek_v4.spec:SPEC",
     ("DeepseekV4ForCausalLM", "deepseek_v41"): "sgl_amd_mono.deepseek_v41.spec:SPEC",
     (
         "DeepseekV4ForCausalLMDSpark",
         "deepseek_v41",
     ): "sgl_amd_mono.deepseek_v41.draft:SPEC",
-    ("DeepseekV4ForCausalLM", "deepseek_v4"): "sgl_amd_mono.deepseek_v4.spec:SPEC",
+    ("Glm5NextForConditionalGeneration", None): "sgl_amd_mono.glm53_flash.spec:SPEC",
+    ("GlmMoeDsaForCausalLM", None): "sgl_amd_mono.glm53.spec:SPEC",
+    ("MiniMaxM3SparseForCausalLM", None): "sgl_amd_mono.minimax.spec:SPEC",
+    (
+        "MiniMaxM3SparseForConditionalGeneration",
+        None,
+    ): "sgl_amd_mono.minimax.spec:SPEC",
 }
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
@@ -42,24 +43,12 @@ SGLANG_READS = {
 
 def register_specs() -> None:
     """The plugin entry point, which SGLang runs in every process."""
-    import inspect
-
     try:
         from sglang.kernels.plugin_kernels.amd.spec import register
     except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
         from sglang.srt.monokernels.spec import register
 
-    for architecture, path in SPECS.items():
-        register(backend=BACKEND, architecture=architecture, path=path)
-    typed = "model_type" in inspect.signature(register).parameters
-    for (architecture, model_type), path in TYPED_SPECS.items():
-        if typed:
-            register(
-                backend=BACKEND,
-                architecture=architecture,
-                path=path,
-                model_type=model_type,
-            )
-        elif model_type == "deepseek_v41":
-            # an SGLang without typed specs takes one spec an architecture: V4.1's
-            register(backend=BACKEND, architecture=architecture, path=path)
+    for (architecture, model_type), path in SPECS.items():
+        register(
+            backend=BACKEND, architecture=architecture, path=path, model_type=model_type
+        )
