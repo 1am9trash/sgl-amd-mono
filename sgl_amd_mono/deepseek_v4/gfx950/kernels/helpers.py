@@ -157,7 +157,8 @@ def poll(
             bad = bad | (v[e] != tag)
         return bad
 
-    return unpack(_spin(load_all, pending))
+    # only the waits on peers take the guard
+    return unpack(_spin(load_all, pending, scope != "agent"))
 
 
 def get(st, base_addr, i):

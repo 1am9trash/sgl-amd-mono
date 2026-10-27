@@ -28,16 +28,16 @@ CHECK_POLLS = 64  # a pending wait checks its deadline and the failure flags thi
 
 
 @flyc.jit
-def _spin(load_all, pending):
+def _spin(load_all, pending, guarded=True):
     """Re-issue ``load_all`` until ``pending`` clears.
 
     Under a guard (``guard.scope``) the wait also stops once its deadline passes
     or once this GPU or a peer failed: a timeout sets the error word and the
     peers' flags, a failure seen elsewhere sets the ``peer`` word, and then the
     launch stops (``guard.stop_launch``): it never runs on with words that did not
-    come."""
+    come. ``guarded=False``: a wait the guard need not bound"""
     g = guard.current()
-    if const_expr(g is None):
+    if const_expr(g is None or not guarded):
         v = load_all()
         while pending(v):
             rocdl.s_sleep(1)
