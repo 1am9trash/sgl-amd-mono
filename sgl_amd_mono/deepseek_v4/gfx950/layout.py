@@ -83,12 +83,11 @@ def ffn_hcc(S: int, hc_mult: int, n_experts: int = N_EXPERTS) -> bool:
 
 
 def router_spt(S: int, n_experts: int = N_EXPERTS) -> int:
-    """Samples per router task: the fewest (at most 8) that fit the grid in one round,
-    doubling only while they divide S (an odd S keeps one: its router takes a second
-    round rather than hold an odd group's rows at once)."""
+    """Samples per router task: the fewest (at most 8, doubling) that fit the grid in one
+    round; an odd S's last task holds fewer (no task holds an odd group's rows at once)."""
     n_router = n_experts // ROUTER_TILE
     spt = 1
-    while S * n_router > BLOCKS * spt and spt < ROUTER_TILE and S % (2 * spt) == 0:
+    while -(-S // spt) * n_router > BLOCKS and spt < ROUTER_TILE:
         spt *= 2
     return spt
 
@@ -334,7 +333,7 @@ def stage_tasks(
         ("o_b", hidden // ROW_TILE),
         ("hcd_f", S * hc_tasks),
         ("hcc_f", (hidden // ROW_TILE) if ffn_hcc(S, hc_mult, n_experts) else 0),
-        ("router", S * (n_experts // ROUTER_TILE) // router_spt(S, n_experts)),
+        ("router", -(-S // router_spt(S, n_experts)) * (n_experts // ROUTER_TILE)),
         # one tile per (routed slot, 8 intermediates); the first INTER / UG8 also carry the shared expert
         ("ug", S * top_k * (inter // UG8)),
         ("down", hidden // dn_tile(S, hidden)),

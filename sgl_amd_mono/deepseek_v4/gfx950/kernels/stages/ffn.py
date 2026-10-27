@@ -145,10 +145,18 @@ def ffn_stages(ctx):
     R_NKC = HIDDEN // 64
     SPT = router_spt(S, N_EXPERTS)
     assert SPT <= ROUTER_TILE
-    for tt in range(start("router"), S * N_ROUTER // SPT, G):
+    # an odd S's last task holds fewer samples
+    R_PARTIAL = S % SPT != 0
+    for tt in range(start("router"), -(-S // SPT) * N_ROUTER, G):
         tt = fx.Int32(tt)
         t = tt % N_ROUTER
         rs0 = (tt // N_ROUTER) * SPT
+
+        def r_smp(s):
+            """Local sample ``s``'s sample index (an absent one reads the last)."""
+            if const_expr(R_PARTIAL):
+                return fx.min(rs0 + s, fx.Int32(S - 1))
+            return rs0 + s
 
         # K-fold: rows / columns 0..7 take the first K half, 8..15 the second
         r_sub = t * ROUTER_TILE % 16
@@ -185,9 +193,9 @@ def ffn_stages(ctx):
                 HC == 1 or FFN_HCC
             ):  # one stream: `a` itself, or hcc_f's `ain`
                 x_src = "ain" if FFN_HCC else "a"
-                specs = [(mb(x_src), ((rs0 + s) * HIDDEN + k) // 2, 2) for s, k in sks]
+                specs = [(mb(x_src), (r_smp(s) * HIDDEN + k) // 2, 2) for s, k in sks]
                 specs += [
-                    (mb(x_src), ((rs0 + s) * HIDDEN + xk) // 2, 1) for s in range(SPT)
+                    (mb(x_src), (r_smp(s) * HIDDEN + xk) // 2, 1) for s in range(SPT)
                 ]
                 v = poll(specs, batch=len(specs))
                 for s in range_constexpr(SPT):
@@ -232,7 +240,10 @@ def ffn_stages(ctx):
         # mix() rounds every value to bf16: a build past 4 samples parks it in LDS
         rstds = stage_x_rmsnorm(ld_a, HIDDEN, g_post, count=SPT, exact_bf16=S > 4)
         for s_l in range_constexpr(SPT):
-            if x_ok:
+            x_live = x_ok
+            if const_expr(R_PARTIAL):
+                x_live = x_live & (rs0 + s_l < S)
+            if x_live:
                 x_s = rs0 + s_l
                 x_rstd = rstds[s_l]
                 a0, a1 = xa[s_l]
@@ -258,7 +269,10 @@ def ffn_stages(ctx):
             fx.Vector.from_elements(acc, fx.Float32), red + (wave * 64 + lane) * 4
         )
         gpu.barrier()
-        if tid < ROUTER_TILE * SPT:
+        r_out = tid < ROUTER_TILE * SPT
+        if const_expr(R_PARTIAL):
+            r_out = r_out & (rs0 + tid // ROUTER_TILE < S)
+        if r_out:
             r = tid % ROUTER_TILE
             n = tid // ROUTER_TILE
             logit = fx.Float32(0.0)
