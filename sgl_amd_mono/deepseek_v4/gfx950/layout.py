@@ -56,6 +56,16 @@ def qkv_a_groups(n_tiles: int) -> int:
     return 2 if n_tiles > BLOCKS and n_tiles % 2 == 0 else 1
 
 
+def qkv_c_groups(n_qkv_a: int, n_qkv_c: int) -> int:
+    """16-row groups per qkv_c task: qkv_a_groups' rule, or two when its tasks and
+    qkv_a's, which run alongside, outnumber the grid (else the CTAs holding both run
+    them one after the other, and the compressors wait on the slowest)."""
+    g = qkv_a_groups(n_qkv_c)
+    if n_qkv_a // qkv_a_groups(n_qkv_a) + n_qkv_c // g > BLOCKS and n_qkv_c % 2 == 0:
+        g = 2
+    return g
+
+
 def q_b_groups(n_tiles: int) -> int:
     """16-row groups per q_b task, by qkv_a_groups' rule."""
     return qkv_a_groups(n_tiles)
@@ -314,7 +324,7 @@ def stage_tasks(
         ("hcc_a", (hidden // ROW_TILE) if hc_mult > 1 else 0),
         ("qkv_a", n_qkv_a // qkv_a_groups(n_qkv_a)),
         # the compressors' projections, BF16 as ATOM
-        ("qkv_c", n_qkv_c // qkv_a_groups(n_qkv_c)),
+        ("qkv_c", n_qkv_c // qkv_c_groups(n_qkv_a, n_qkv_c)),
         ("cache", 1),
         ("cmp", S if compress_ratio else 0),
         ("i_cmp", S if index_head_dim else 0),

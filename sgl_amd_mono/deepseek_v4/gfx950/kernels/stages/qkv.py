@@ -52,6 +52,7 @@ from sgl_amd_mono.deepseek_v4.gfx950.layout import (
     QKV_A_TILE,
     q_b_groups,
     qkv_a_groups,
+    qkv_c_groups,
 )
 
 
@@ -129,10 +130,10 @@ def qkv_stages(ctx):
     r_wqc = rsrc(w_qkv_c)
     QA_NKC = HIDDEN // 64
 
-    def qkv_stage(name, n_tiles, row0, bf16_w):
-        """One fused-GEMV stage over n_tiles 16-row groups from global row row0: the
-        FP8 q_a | kv rows (qkv_a) or the compressors' BF16 rows (qkv_c)."""
-        QA_R = qkv_a_groups(n_tiles)
+    def qkv_stage(name, n_tiles, row0, bf16_w, groups):
+        """One fused-GEMV stage over n_tiles 16-row groups from global row row0, ``groups``
+        a task: the FP8 q_a | kv rows (qkv_a) or the compressors' BF16 rows (qkv_c)."""
+        QA_R = groups
         QA_WPR = WAVES // QA_R
         QA_UPW = QA_NKC // QA_WPR
         # units in flight per wave (larger BF16 batches spill VGPRs)
@@ -215,9 +216,9 @@ def qkv_stages(ctx):
                 else:
                     put(mb("i_gate"), s * IW + row - Q_LORA - HEAD_DIM - 2 * CW - IW, v)
 
-    qkv_stage("qkv_a", N_QKV_A, 0, False)
+    qkv_stage("qkv_a", N_QKV_A, 0, False, qkv_a_groups(N_QKV_A))
     if const_expr(N_QKV_C):
-        qkv_stage("qkv_c", N_QKV_C, QKV_A_ROWS, True)
+        qkv_stage("qkv_c", N_QKV_C, QKV_A_ROWS, True, qkv_c_groups(N_QKV_A, N_QKV_C))
 
     def kv_quant(nv):
         """This thread's KV channel through the NoPE FP8 round trip (one 64-group per
