@@ -72,7 +72,6 @@ def attention_stages(ctx):
     NOPE_DIM = ctx["NOPE_DIM"]
     N_ISEL = ctx["N_ISEL"]
     N_KEYS = ctx["N_KEYS"]
-    N_OA = ctx["N_OA"]
     N_ROW_TILES = ctx["N_ROW_TILES"]
     N_SPLIT = ctx["N_SPLIT"]
     N_UV = ctx["N_UV"]
@@ -657,13 +656,21 @@ def attention_stages(ctx):
     OA_R = ROW_TILE // 16
     OA_WPR = WAVES // OA_R
     OA_SPT = o_a_spt(S, O_GROUPS, O_LORA)
-    for tt in range(start("o_a"), N_OA // OA_SPT, G):
+    # an odd S's last task holds one sample (its second column repeats it, unpublished)
+    OA_PARTIAL = S % OA_SPT != 0
+    for tt in range(start("o_a"), -(-S // OA_SPT) * O_GROUPS * OA_PER_GROUP, G):
         tt = fx.Int32(tt)
         s = (tt // (O_GROUPS * OA_PER_GROUP)) * OA_SPT
         t = tt % (O_GROUPS * OA_PER_GROUP)
         grp = t // OA_PER_GROUP
         # B column n holds sample s + n (columns past OA_SPT repeat the last)
         oa_col = fx.min(lane % 16, OA_SPT - 1)
+
+        def oa_src(k):
+            n = s + k // OA_K
+            if const_expr(OA_PARTIAL):
+                n = fx.min(n, fx.Int32(S - 1))
+            return (n * H) * HEAD_DIM + grp * OA_K + k % OA_K
 
         def u_oa(c):
             kc = (wave % OA_WPR) * (OA_NKC // OA_WPR) + c
@@ -680,16 +687,15 @@ def attention_stages(ctx):
 
         pre = [u_oa(c) for c in range(OA_NKC // OA_WPR)]
         hint_wait()
-        stage_x_pairs(
-            "o",
-            OA_SPT * OA_K,
-            lambda k: ((s + k // OA_K) * H) * HEAD_DIM + grp * OA_K + k % OA_K,
-        )
+        stage_x_pairs("o", OA_SPT * OA_K, oa_src)
         gpu.barrier()
         acc = run_units(u_oa, OA_NKC // OA_WPR, OA_NKC // OA_WPR, pre)
         reduce_rows(OA_R, acc, emit_out(ROW_TILE))
         gpu.barrier()
-        if tid < OA_SPT * ROW_TILE // 4:
+        oa_out = tid < OA_SPT * ROW_TILE // 4
+        if const_expr(OA_PARTIAL):
+            oa_out = oa_out & (s + tid // (ROW_TILE // 4) < S)
+        if oa_out:
             n = tid // (ROW_TILE // 4)
             r = tid % (ROW_TILE // 4) * 4
             put_bf(

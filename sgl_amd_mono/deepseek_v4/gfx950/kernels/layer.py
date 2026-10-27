@@ -414,7 +414,6 @@ def build_dsv4_kernel(
     N_UV = H * HEAD_DIM // UV_TILE
     UV_PER_HEAD = HEAD_DIM // UV_TILE
     OA_K = H * HEAD_DIM // O_GROUPS  # one group's slice of the concatenated heads
-    N_OA = S * O_GROUPS * O_LORA // ROW_TILE
     OA_PER_GROUP = O_LORA // ROW_TILE
     OB_K = O_GROUPS * O_LORA
     UG_PER_SLOT = INTER // UG8

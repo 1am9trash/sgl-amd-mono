@@ -71,8 +71,9 @@ def uv_tile(S: int, heads: int, head_dim: int) -> int:
 
 
 def o_a_spt(S: int, o_groups: int, o_lora: int) -> int:
-    """Samples per o_a task: two (in two MFMA B columns) once the tasks outgrow the grid."""
-    return 2 if S % 2 == 0 and S * o_groups * o_lora // ROW_TILE > BLOCKS else 1
+    """Samples per o_a task: two (in two MFMA B columns) once the tasks outgrow the grid;
+    an odd S's last task holds one."""
+    return 2 if S > 1 and S * o_groups * o_lora // ROW_TILE > BLOCKS else 1
 
 
 def ffn_hcc(S: int, hc_mult: int, n_experts: int = N_EXPERTS) -> bool:
@@ -329,7 +330,7 @@ def stage_tasks(
         ("i_topk", S * n_topk_parts(max_seq, compress_ratio, index_head_dim)),
         ("split", S * ((window if n_keys is None else n_keys) // SPLIT_KEYS)),
         ("uv", S * (heads * head_dim // uv_tile(S, heads, head_dim))),
-        ("o_a", S * o_groups * o_lora // ROW_TILE // o_a_spt(S, o_groups, o_lora)),
+        ("o_a", -(-S // o_a_spt(S, o_groups, o_lora)) * o_groups * o_lora // ROW_TILE),
         ("o_b", hidden // ROW_TILE),
         ("hcd_f", S * hc_tasks),
         ("hcc_f", (hidden // ROW_TILE) if ffn_hcc(S, hc_mult, n_experts) else 0),
